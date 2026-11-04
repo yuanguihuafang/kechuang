@@ -1,0 +1,116 @@
+# Production override for the single-server Docker Compose deployment.
+# Copy this file to config.yaml and set DEER_FLOW_CONFIG_PATH to its absolute path.
+# Secrets stay in .env; values below use the runtime environment expansion syntax.
+
+config_version: 34
+
+auth:
+  local:
+    allow_registration: false
+
+database:
+  backend: postgres
+  postgres_url: $DATABASE_URL
+  pool_size: 10
+  pool_recycle: 300
+  command_timeout: 30
+
+run_events:
+  backend: db
+  max_trace_content: 10240
+  track_token_usage: true
+
+token_budget:
+  enabled: true
+  max_tokens: 200000
+  warn_threshold: 0.8
+  hard_stop_threshold: 1.0
+
+stream_bridge:
+  type: redis
+  redis_url: $DEER_FLOW_STREAM_BRIDGE_REDIS_URL
+  queue_maxsize: 256
+  stream_ttl_seconds: 86400
+  max_connections: 100
+
+tool_groups:
+  - name: web
+  - name: file:read
+  - name: file:write
+  - name: bash
+
+tools:
+  # No API key required; uses DuckDuckGo's public search backend.
+  - name: web_search
+    group: web
+    use: deerflow.community.ddg_search.tools:web_search_tool
+    max_results: 5
+
+  - name: web_fetch
+    group: web
+    use: deerflow.community.crawl4ai.tools:web_fetch_tool
+    base_url: http://crawl4ai:11235
+    token: $CRAWL4AI_TOKEN
+    timeout: 30
+    filter: fit
+
+  # No API key required; searches image references through DuckDuckGo.
+  - name: image_search
+    group: web
+    use: deerflow.community.image_search.tools:image_search_tool
+    max_results: 5
+
+  - name: ls
+    group: file:read
+    use: deerflow.sandbox.tools:ls_tool
+
+  - name: read_file
+    group: file:read
+    use: deerflow.sandbox.tools:read_file_tool
+
+  - name: glob
+    group: file:read
+    use: deerflow.sandbox.tools:glob_tool
+    max_results: 200
+
+  - name: grep
+    group: file:read
+    use: deerflow.sandbox.tools:grep_tool
+    max_results: 100
+
+  - name: write_file
+    group: file:write
+    use: deerflow.sandbox.tools:write_file_tool
+
+  - name: str_replace
+    group: file:write
+    use: deerflow.sandbox.tools:str_replace_tool
+
+  - name: bash
+    group: bash
+    use: deerflow.sandbox.tools:bash_tool
+
+summarization:
+  enabled: true
+  trigger:
+    - type: tokens
+      value: 32000
+
+models:
+  - name: sidus-deepseek-v4-flash-vision
+    display_name: DeepSeek V4 Flash Vision Exp
+    use: deerflow.models.patched_openai:PatchedChatOpenAI
+    model: DeepSeek-V4-Flash-Vision-Exp
+    base_url: https://model.sidus-ai.com/api/open-apis/v1
+    api_key: $SIDUS_API_KEY
+    timeout: 600.0
+    max_retries: 2
+    supports_vision: true
+
+sandbox:
+  # Sandboxes run as isolated Pods managed by the private provisioner service.
+  use: deerflow.community.aio_sandbox:AioSandboxProvider
+  provisioner_url: http://provisioner:8002
+  provisioner_api_key: $PROVISIONER_API_KEY
+  thread_data_mounts: false
+  allow_host_bash: false

@@ -1,0 +1,180 @@
+---
+title: Integration Guide
+description: OPIE OS Harness is not only a standalone application. It is a Python library you can import and use inside your own backend, API server, automation system, or multi-agent orchestrator.
+---
+
+import { Callout } from "nextra/components";
+
+# Integration Guide
+
+<Callout type="info" emoji="🔌">
+  OPIE OS Harness can be embedded into any Python application. This guide
+  covers the integration patterns for using OPIE OS as a library inside your
+  own system.
+</Callout>
+
+OPIE OS Harness is not only a standalone application. It is a Python library you can import and use inside your own backend, API server, automation system, or multi-agent orchestrator.
+
+## Embedding OpieClient
+
+The primary integration point is `OpieClient`. It wraps the LangGraph runtime and exposes a clean API for sending messages and streaming responses from any Python application.
+
+```python
+from opie.client import OpieClient
+from opie.config import load_config
+
+# Load configuration (reads config.yaml or OPIE_CONFIG_PATH)
+load_config()
+
+client = OpieClient()
+```
+
+The client is thread-safe and designed to be instantiated once and reused across requests.
+
+## Async streaming
+
+The recommended integration pattern is async streaming. This gives you real-time access to each token and event as the agent produces it:
+
+```python
+import asyncio
+
+async def run_agent(thread_id: str, user_message: str):
+    async for event in client.astream(
+        thread_id=thread_id,
+        message=user_message,
+        config={
+            "configurable": {
+                "model_name": "gpt-4o",
+                "subagent_enabled": True,
+            }
+        },
+    ):
+        # Process each streaming event
+        yield event
+
+# In a FastAPI handler:
+# from fastapi.responses import StreamingResponse
+# return StreamingResponse(run_agent(thread_id, message), media_type="text/event-stream")
+```
+
+## Non-streaming invocation
+
+For batch processing or when you only need the final result:
+
+```python
+async def run_agent_sync(thread_id: str, user_message: str) -> dict:
+    result = await client.ainvoke(
+        thread_id=thread_id,
+        message=user_message,
+    )
+    return result
+```
+
+## Thread management
+
+Threads represent persistent conversations. Use unique thread IDs to isolate different user sessions:
+
+```python
+import uuid
+
+# New conversation
+thread_id = str(uuid.uuid4())
+
+# Continuing an existing conversation (same thread_id)
+# The agent will see the full history if a checkpointer is configured
+await client.ainvoke(thread_id=existing_thread_id, message="Follow up question")
+```
+
+## Custom per-agent configuration
+
+Build domain-specific agents by creating named agent configs and passing the `agent_name` at runtime:
+
+```python
+# agents/research-assistant/config.yaml must exist with skills and tool config
+
+result = await client.ainvoke(
+    thread_id=thread_id,
+    message=user_message,
+    config={
+        "configurable": {
+            "agent_name": "research-assistant",
+            "model_name": "gpt-4o",
+        }
+    },
+)
+```
+
+## Integrating with FastAPI
+
+OPIE OS Gateway is itself a FastAPI application. You can mount it as a sub-application or router:
+
+```python
+from fastapi import FastAPI
+from opie.config import load_config
+
+load_config()
+
+app = FastAPI()
+
+# Mount the OPIE OS gateway router
+from opie.app.gateway.main import app as gateway_app
+app.mount("/opie", gateway_app)
+```
+
+Or use `OpieClient` directly in your own FastAPI routes with streaming:
+
+```python
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+from opie.client import OpieClient
+
+app = FastAPI()
+client = OpieClient()
+
+@app.post("/chat/{thread_id}")
+async def chat(thread_id: str, body: dict):
+    async def generate():
+        async for event in client.astream(thread_id=thread_id, message=body["message"]):
+            yield f"data: {event}\n\n"
+    return StreamingResponse(generate(), media_type="text/event-stream")
+```
+
+## Integrating with LangGraph
+
+OPIE OS Harness is built on LangGraph. The Lead Agent is a standard LangGraph graph. You can compose it with your own LangGraph nodes and graphs:
+
+```python
+from opie.agents.lead_agent.agent import make_lead_agent
+from langgraph.graph import StateGraph
+
+# Access the underlying LangGraph agent factory
+agent = make_lead_agent(config)
+```
+
+## Configuration in embedded mode
+
+When embedded in another application, set the config path explicitly to avoid ambiguity:
+
+```python
+import os
+os.environ["OPIE_CONFIG_PATH"] = "/path/to/my-opie-config.yaml"
+
+from opie.config import load_config
+load_config()
+```
+
+Or pass the path directly:
+
+```python
+from opie.config import load_config
+load_config(config_path="/path/to/my-opie-config.yaml")
+```
+
+## MCP server integration
+
+OPIE OS can expose its agent as an MCP server, allowing other MCP-compatible systems to call it as a tool. Refer to the OPIE OS repository for MCP server integration examples.
+
+<Cards num={2}>
+  <Cards.Card title="Customization" href="/docs/harness/customization" />
+  <Cards.Card title="Configuration" href="/docs/harness/configuration" />
+</Cards>

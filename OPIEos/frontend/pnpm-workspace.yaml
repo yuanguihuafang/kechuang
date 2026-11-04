@@ -1,0 +1,11 @@
+packages: []
+patchedDependencies:
+  next-themes@0.4.6: patches/next-themes@0.4.6.patch
+allowBuilds:
+  esbuild: true
+  sharp: true
+  unrs-resolver: true
+ignoredBuiltDependencies:
+  - esbuild
+  - sharp
+  - unrs-resolver

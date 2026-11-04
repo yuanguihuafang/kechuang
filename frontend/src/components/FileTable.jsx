@@ -1,0 +1,37 @@
+import { Fragment } from 'react';
+import { stageLabel } from './Pipeline.jsx';
+
+function formatBytes(size) {
+  if (!size) return '—';
+  return size < 1024 * 1024 ? `${Math.ceil(size / 1024)} KB` : `${(size / 1024 / 1024).toFixed(1)} MB`;
+}
+
+const taskStatusLabel = (task) => {
+  if (task?.status === 'SUCCEEDED' && task.lifecycle_action === 'recycle') return '已移入回收站';
+  if (task?.status === 'SUCCEEDED' && task.lifecycle_action === 'purge') return '已删除';
+  return ({
+    WAITING_CONFIRM: '解析完成，待确认', WAITING_DRAFT_CONFIRM: '草稿待确认', WAITING_INTENT_CONFIRM: '意图待确认', MANUAL_REVIEW: '待人工接管', RECOVERING: '恢复中', SUCCEEDED: '已建立索引', FAILED: '任务失败',
+  }[task?.status] || task?.status);
+};
+
+const publicationLabel = (status) => ({ PUBLISHED: '可检索', UNPUBLISHED: '已下架', PURGED: '已删除' }[status] || status);
+
+export function FileTable({ files, selectedId, onSelect, renderDetail, loading }) {
+  if (loading) return <div className="table-empty">正在读取 PostgreSQL 文档目录…</div>;
+  if (!files.length) return <div className="table-empty">文档目录中还没有材料。</div>;
+  return <div className="file-table-wrap">
+    <table className="file-table">
+      <thead><tr><th>文件</th><th>范围</th><th>进度</th><th>更新时间</th><th /></tr></thead>
+      <tbody>{files.map((file) => <Fragment key={file.storage_key}>
+        <tr key={file.storage_key} className={selectedId === file.document_id ? 'selected' : ''}>
+          <td><strong title={file.file_name}>{file.file_name}</strong><small>{formatBytes(file.file_size)}</small></td>
+          <td>{file.scope_id || '未记录'}</td>
+          <td><span className={`stage stage-${file.storage_key ? (file.stage || 'upload') : 'legacy'}`}>{file.supervisor_task ? taskStatusLabel(file.supervisor_task) : stageLabel(file.storage_key ? (file.stage || 'upload') : 'legacy')}</span>{file.active_version?.publication_status && <small>{publicationLabel(file.active_version.publication_status)}</small>}{file.active_version?.unpublish_reason_code && <small className="table-error">下架原因：{file.active_version.unpublish_reason_text || file.active_version.unpublish_reason_code}</small>}{file.supervisor_task?.stage && <small>{file.supervisor_task.stage}</small>}{file.indexed_count ? <small>{file.indexed_count} chunks</small> : null}{file.supervisor_task?.status === 'FAILED' && <small className="table-error" title={file.supervisor_task.error || '任务失败'}>{file.supervisor_task.error_code || 'FAILED'}：{file.supervisor_task.error || '未提供错误详情'}</small>}</td>
+          <td>{file.updated_at ? new Date(file.updated_at).toLocaleString('zh-CN', { hour12: false }) : '—'}</td>
+          <td className="file-actions">{file.status === 'PURGED' || file.active_version?.publication_status === 'PURGED' ? <span className="task-status task-status-purged">已删除</span> : <button className="text-button" type="button" onClick={() => onSelect(file)} aria-expanded={selectedId === file.document_id}>{selectedId === file.document_id ? '收起详情' : '查看详情'}</button>}</td>
+        </tr>
+        {selectedId === file.document_id && <tr className="file-detail-row"><td colSpan="5">{renderDetail?.(file)}</td></tr>}
+      </Fragment>)}</tbody>
+    </table>
+  </div>;
+}

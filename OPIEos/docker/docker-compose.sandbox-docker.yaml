@@ -1,0 +1,25 @@
+# Opt-in single-host Docker sandbox backend.
+# The Docker socket is mounted only into the provisioner, never the Gateway.
+services:
+  provisioner:
+    environment:
+      PROVISIONER_BACKEND: docker
+      SANDBOX_NETWORK: ${SANDBOX_NETWORK:-deer-flow-sandbox}
+      SANDBOX_HOST: ${SANDBOX_HOST:-host.docker.internal}
+      SANDBOX_BIND_HOST: ${SANDBOX_BIND_HOST:-172.17.0.1}
+      SANDBOX_COMMAND: ${SANDBOX_COMMAND:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # The Docker daemon resolves bind sources on the host, while this
+      # container performs existence checks before creating the sandbox.
+      - ${DEER_FLOW_HOME}:${DEER_FLOW_HOME}:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - deer-flow
+      - sandbox-control
+
+networks:
+  sandbox-control:
+    name: deer-flow-sandbox
+    driver: bridge

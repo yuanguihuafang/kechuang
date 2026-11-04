@@ -1,0 +1,7 @@
+{
+  "knowledge_type": "enterprise",
+  "mode": "step_rerank_on_top20_annotation",
+  "top_k": 20,
+  "review_file": "/home/zyx/kechuang/backend/evaluation/output/annotation/enterprise/review.xlsx",
+  "message": "请人工复核 review.xlsx 的 review_relevant 列，再用 --review-dir 做正式评测"
+}

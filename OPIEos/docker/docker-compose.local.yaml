@@ -1,0 +1,14 @@
+# Local development overlay. Do not use this file for internet-facing deployments.
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:15432:5432"
+  redis:
+    ports:
+      - "127.0.0.1:6379:6379"
+  gateway:
+    environment:
+      # The host-run development Gateway uses 127.0.0.1 from .env. A Gateway
+      # container must use Compose service names instead.
+      DATABASE_URL: postgresql://${POSTGRES_USER:-deerflow}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-deerflow}
+      DEER_FLOW_STREAM_BRIDGE_REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0

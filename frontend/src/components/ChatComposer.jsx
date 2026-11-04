@@ -1,0 +1,9 @@
+import { VoiceInput } from './VoiceInput.jsx';
+
+export function ChatComposer({ uploadFile, uploadInputRef, knowledgeType, onKnowledgeTypeChange, onFileChange, submitUpload, uploadBusy, busy, interruptChat, message, setMessage, submit, reset, identity, uploadMessage, onTranscript }) {
+  return <>
+    {uploadFile && <div className="chat-attachment-row"><span className="chat-upload-name" title={uploadFile.name}>{uploadFile.name}</span><select aria-label="上传内容类型" value={knowledgeType} onChange={(event) => onKnowledgeTypeChange(event.target.value)}><option value="demand">需求</option><option value="solution">技术方案</option><option value="achievement">科研成果</option></select><button type="button" onClick={submitUpload} disabled={uploadBusy}>{uploadBusy ? '处理中…' : '上传并解析'}</button></div>}
+    <form className="chat-form" onSubmit={submit}><label htmlFor="supervisor-message">输入你的问题或需求</label><div className="composer-row"><label className="composer-attach" title="添加材料"><input ref={uploadInputRef} type="file" accept=".pdf,.ppt,.pptx,.doc,.docx,.xls,.xlsx,.png,.jpg,.jpeg,.md,.txt,.wav,.mp3,.m4a,.aac,.ogg,.webm,audio/*" onChange={onFileChange} /><span aria-hidden="true">＋</span></label><VoiceInput onTranscript={onTranscript} disabled={busy || uploadBusy} /><textarea id="supervisor-message" value={message} onChange={(event) => setMessage(event.target.value)} placeholder="请输入你的需求" rows="2" /><button className={`composer-send${busy ? ' composer-cancel' : ''}`} type={busy ? 'button' : 'submit'} onClick={busy ? interruptChat : undefined} aria-label={busy ? '中断回答' : '发送问题'} title={busy ? '中断回答' : '发送问题'}>{busy ? '中断' : '➤'}</button></div><div className="chat-actions"><span>当前身份：{identity.name || identity.user_id} · {identity.user_role}</span><button type="button" className="secondary" onClick={reset} disabled={busy}>清空对话</button></div></form>
+    {uploadMessage && <p className="chat-upload-message" role="status">{uploadMessage}</p>}
+  </>;
+}

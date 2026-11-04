@@ -1,0 +1,89 @@
+"use client";
+
+import { BellIcon } from "lucide-react";
+
+import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
+import { useI18n } from "@/core/i18n/hooks";
+import { useNotification } from "@/core/notification/hooks";
+import { useLocalSettings } from "@/core/settings";
+
+import { SettingsSection } from "./settings-section";
+
+export function NotificationSettingsPage() {
+  const { t } = useI18n();
+  const { permission, isSupported, requestPermission, showNotification } =
+    useNotification();
+
+  const [settings, setSettings] = useLocalSettings();
+
+  const handleRequestPermission = async () => {
+    await requestPermission();
+  };
+
+  const handleTestNotification = () => {
+    showNotification(t.settings.notification.testTitle, {
+      body: t.settings.notification.testBody,
+    });
+  };
+
+  const handleEnableNotification = async (enabled: boolean) => {
+    setSettings("notification", {
+      enabled,
+    });
+  };
+
+  if (!isSupported) {
+    return (
+      <SettingsSection
+        title={t.settings.notification.title}
+        description={t.settings.notification.description}
+      >
+        <p className="text-sm text-[var(--neumo-text-muted)]">
+          {t.settings.notification.notSupported}
+        </p>
+      </SettingsSection>
+    );
+  }
+
+  return (
+    <SettingsSection
+      title={t.settings.notification.title}
+      description={
+        <div className="flex items-center gap-3">
+          <div className="flex-1">{t.settings.notification.description}</div>
+          <Switch
+            aria-label={t.settings.notification.title}
+            disabled={permission !== "granted"}
+            checked={permission === "granted" && settings.notification.enabled}
+            onCheckedChange={handleEnableNotification}
+          />
+        </div>
+      }
+    >
+      <div className="flex flex-col gap-4">
+        {permission === "default" && (
+          <Button onClick={handleRequestPermission} variant="default">
+            <BellIcon className="mr-2 size-4" />
+            {t.settings.notification.requestPermission}
+          </Button>
+        )}
+
+        {permission === "denied" && (
+          <p className="neumo-inset rounded-xl p-3 text-sm text-[var(--neumo-warning)]">
+            {t.settings.notification.deniedHint}
+          </p>
+        )}
+
+        {permission === "granted" && settings.notification.enabled && (
+          <div className="flex flex-col gap-4">
+            <Button onClick={handleTestNotification} variant="outline">
+              <BellIcon className="mr-2 size-4" />
+              {t.settings.notification.testButton}
+            </Button>
+          </div>
+        )}
+      </div>
+    </SettingsSection>
+  );
+}

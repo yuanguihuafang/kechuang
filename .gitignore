@@ -1,0 +1,118 @@
+# ---------- 密钥与环境 ----------
+.env
+/.deer-flow/.jwt_secret
+.env.*
+**/.env
+**/.env.*
+**/.env.local
+**/.env.server
+!backend/.env.example
+
+# ---------- Python 通用 ----------
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+**/.pytest_cache/
+.pytest_tmp/
+**/.pytest_tmp/
+.ruff_cache/
+**/.ruff_cache/
+*.egg-info/
+**/*.egg-info/
+build/
+dist/
+.venv/
+venv/
+**/.venv/
+**/venv/
+
+# ---------- Node / 前端 ----------
+node_modules/
+**/node_modules/
+.pnpm-store/
+**/*.log
+frontend/dist/
+frontend/.vite/
+
+# ---------- OPIEos-main (DeerFlow fork) ----------
+# 屏蔽 DeerFlow 上游默认忽略的路径
+OPIEos-main/.pytest_cache/
+OPIEos-main/**/.pytest_cache/
+OPIEos-main/.pytest_tmp/
+OPIEos-main/**/.pytest_tmp/
+OPIEos-main/.pytest-temp/
+OPIEos-main/**/.pytest-temp/
+OPIEos-main/.ruff_cache/
+OPIEos-main/.venv/
+OPIEos-main/venv/
+OPIEos-main/.env
+OPIEos-main/.env.local
+OPIEos-main/.env.*.local
+OPIEos-main/node_modules/
+OPIEos-main/frontend/dist/
+OPIEos-main/frontend/node_modules/
+OPIEos-main/pr-build/
+OPIEos-main/graphify-out/
+OPIEos-main/.chrome-debug-profile/
+OPIEos-main/.playwright-cli/
+OPIEos-main/**/.playwright-cli/
+OPIEos-main/.superpowers/
+OPIEos-main/.agent/
+OPIEos-main/.mcp_config*
+OPIEos-main/.deer-flow/
+OPIEos-main/.claude/
+OPIEos-main/.idea/
+OPIEos-main/.omc/
+OPIEos-main/.githooks/
+OPIEos-main/.gstack/
+OPIEos-main/.monocle/
+OPIEos-main/.worktrees
+OPIEos-main/.coverage
+OPIEos-main/htmlcov/
+OPIEos-main/.DS_Store
+OPIEos-main/uv.lock
+OPIEos-main/**/uv.lock
+# DeerFlow 默认配置（运行时生成，不入库）
+OPIEos-main/config.yaml
+OPIEos-main/mcp_config.json
+OPIEos-main/extensions_config.json
+# 跑分与日志
+OPIEos-main/bench_results.jsonl
+OPIEos-main/bench_optimized.jsonl
+OPIEos-main/results.jsonl
+OPIEos-main/logs/
+OPIEos-main/log/
+OPIEos-main/debug.log
+OPIEos-main/.deer-flow/
+
+# ---------- 运行时输出 ----------
+data/
+/bakup/
+/OPIEos/服务器/
+/OPIEos/config.yaml.codex-backup-20261009
+/backend/evaluation/output/annotation/enterprise/review.xlsx
+/deploy_kechuang_assets.py
+/register_translator.py
+/view_user_uuid.py
+logs/
+**/logs/
+
+# ---------- IDE 与本地配置 ----------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# ---------- QA / 调试临时产物 ----------
+.chrome-debug-profile/
+.playwright-cli/
+**/.playwright-cli/
+.qa_frontend_design/
+
+# 注：16 个 SKILL.md 需要用 `git add -f` 强加，
+# 因为 OPIEos-main/.gitignore 默认排除 skills/custom/*。
