@@ -8,6 +8,7 @@ from core.contracts.agent import AgentContext
 from core.contracts.knowledge import DocumentUnpublishRequest
 from core.contracts.tools import ToolContext
 from services.observability.metrics import metrics
+from services.persistence.retention import serialize_storage_references
 
 
 class InProcessToolAdapter:
@@ -22,11 +23,13 @@ class InProcessToolAdapter:
         retrieval_module: Any,
         lifecycle_store: Any | None = None,
         web_search_module: Any | None = None,
+        draft_store: Any | None = None,
     ) -> None:
         self.perception = perception_module
         self.retrieval = retrieval_module
         self.lifecycle_store = lifecycle_store
         self.web_search = web_search_module
+        self.draft_store = draft_store
 
     @staticmethod
     def _tool_context(
@@ -273,6 +276,7 @@ class InProcessToolAdapter:
             self.lifecycle_store.purge_document(document_id)
         return {"status": "DELETED", "retrieval": unpublish_body, "perception": deleted}
 
+    @serialize_storage_references
     async def delete_version(
         self,
         arguments: dict[str, Any],
@@ -297,24 +301,44 @@ class InProcessToolAdapter:
 
         document_id = str(arguments["document_id"])
         version_id = str(arguments["version_id"])
-        request = DocumentUnpublishRequest.model_validate(
-            {
-                "scope_id": arguments.get("scope_id", "public"),
-                "version_id": version_id,
-                "knowledge_type": arguments.get("knowledge_type"),
-                "identity": {
-                    "user_id": arguments.get("user_id", ""),
-                    "user_role": (arguments.get("identity") or {}).get("user_role", "admin"),
-                },
-                "remove_vectors": True,
-            }
-        )
-        unpublish = await self.retrieval.unpublish_document(document_id, request)
-        unpublish_body = unpublish.model_dump()
-        if unpublish_body.get("status") not in {"UNPUBLISHED", "SUCCESS"}:
-            return {"status": "FAILED", "error": "旧版本向量清理失败", "retrieval": unpublish_body}
+        store = self.lifecycle_store
+        if store is None or arguments.get("preserve_current_vectors") is not True:
+            raise ValueError("旧版本清理必须核实活动版本并保留当前索引")
+        version = store.get_version(version_id)
+        replacement_id = str(arguments.get("replacement_version_id") or "")
+        replacement = store.get_version(replacement_id) if replacement_id else None
+        document = store.get_document(document_id, include_purged=True)
+        key = str(arguments.get("storage_key") or "").strip()
+        if (not document or not version or version.get("document_id") != document_id
+                or not key or version.get("storage_key") != key
+                or not replacement or replacement.get("document_id") != document_id
+                or document.get("active_version_id") != replacement_id
+                or version_id == replacement_id or replacement.get("status") not in {"PUBLISHED", "INDEXED"}
+                or replacement.get("publication_status") != "PUBLISHED"
+                or replacement.get("storage_key") != arguments.get("replacement_storage_key")):
+            raise ValueError("旧版本、原件或已发布活动替代版本不匹配")
+        if version.get("status") == "PURGED":
+            return {"status": "DELETED", "already_purged": True}
+        if store.is_storage_key_referenced(key, exclude_version_ids=(version_id,)):
+            return {"status": "SKIPPED", "reason": "原件仍被其他版本引用"}
+        drafts = self.draft_store
+        if drafts is None:
+            from services.persistence.postgres import PostgresDraftStore
+
+            drafts = PostgresDraftStore()
+            self.draft_store = drafts
+        if any(row.get("status") != "DELETED" for row in drafts.list_storage_key_references(key)):
+            return {"status": "SKIPPED", "reason": "原件仍被草稿引用"}
+        for row in drafts.list_for_document(document_id):
+            if row.get("status") != "PUBLISHED":
+                continue
+            attachments = [item for item in (row.get("draft") or {}).get("attachments") or []
+                           if isinstance(item, dict) and item.get("document_id") == document_id]
+            if not attachments or any(item.get("version_id") in {None, "", version_id}
+                                      for item in attachments):
+                return {"status": "SKIPPED", "reason": "旧版本仍有发布引用"}
         delete_original = getattr(self.perception, "delete_original_file", None)
         if delete_original is None:
             return {"status": "FAILED", "error": "Perception 未提供旧原文件清理接口"}
-        deleted = await delete_original(storage_key=str(arguments["storage_key"]))
-        return {"status": "DELETED", "retrieval": unpublish_body, "perception": deleted}
+        deleted = await delete_original(storage_key=key)
+        return {"status": "DELETED", "perception": deleted}

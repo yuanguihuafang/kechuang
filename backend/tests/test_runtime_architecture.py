@@ -34,13 +34,14 @@ def test_retired_model_roles_and_failover_are_absent():
     assert not (Path(__file__).resolve().parents[1] / "services/llm/fallback_client.py").exists()
 
 
-def test_reasoning_role_uses_dedicated_model_and_falls_back_to_default():
+def test_reasoning_role_uses_dedicated_model_and_falls_back_to_default(monkeypatch):
     from runtime.config import Settings, settings_for_role
 
-    settings = Settings(llm_model="default-model", llm_reasoning_model="reasoning-model")
+    monkeypatch.delenv("LLM_REASONING_MODEL", raising=False)
+    settings = Settings(_env_file=None, llm_model="default-model", llm_reasoning_model="reasoning-model")
     assert settings.model_for_role("reasoning") == "reasoning-model"
     assert settings_for_role(settings, "reasoning").llm_model == "reasoning-model"
-    assert Settings(llm_model="default-model").model_for_role("reasoning") == "default-model"
+    assert Settings(_env_file=None, llm_model="default-model").model_for_role("reasoning") == "default-model"
 
 
 def test_retired_memory_model_is_absent():

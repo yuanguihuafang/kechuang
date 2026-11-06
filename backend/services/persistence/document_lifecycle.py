@@ -7,7 +7,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import bindparam, func, or_, select, text
 
 from .sqlalchemy import get_engine, platform_documents
 
@@ -108,7 +108,12 @@ class DocumentLifecycleStore:
         self._validate_status(status)
         self._validate_publication_status(publication_status)
         self._validate_index_status(index_status)
+        if version_number < 1:
+            raise ValueError("版本号必须为正整数")
         version_id = version_id or f"{document_id}:v{version_number}"
+        existing_identity = self.get_version(version_id)
+        if existing_identity and existing_identity["document_id"] != document_id:
+            raise ValueError("版本 ID 已属于其他文档")
         now = _now()
         with self.engine.begin() as conn:
             row = (
@@ -122,6 +127,23 @@ class DocumentLifecycleStore:
                 .mappings()
                 .first()
             )
+            if row:
+                versions = [self._row_to_version(row, document_id, is_current=True)] + [
+                    _with_publication_label(item, is_current=False)
+                    for item in (row["version_history"] or [])
+                ]
+                existing = next((item for item in versions if item["version_id"] == version_id), None)
+                if existing:
+                    if existing["status"] == "PURGED" or any(
+                        existing.get(key) != value for key, value in {
+                            "storage_key": storage_key, "version_number": version_number,
+                            "scope_id": scope_id, "user_id": user_id,
+                        }.items()
+                    ):
+                        raise ValueError("版本 ID 已存在，拒绝替换原件或复活已删除版本")
+                    return existing
+                if version_number <= max(int(item["version_number"]) for item in versions):
+                    raise ValueError("新版本号必须大于已有版本号")
             values = {
                 "document_id": document_id,
                 "source_name": source_name,
@@ -167,6 +189,51 @@ class DocumentLifecycleStore:
             else:
                 conn.execute(platform_documents.insert().values(**values))
         return self.get_version(version_id) or {}
+
+    def bind_draft_attachments(
+        self, attachments: list[dict[str, Any]], *, user_id: str, knowledge_type: str
+    ) -> list[str]:
+        """补齐先上传后确认用途的分类；不替换原件、版本或已有分类。"""
+        if knowledge_type not in {"demand", "solution", "achievement"}:
+            return []
+        updated = []
+        with self.engine.begin() as conn:
+            for attached in attachments:
+                document_id = str(attached.get("document_id") or "")
+                if not document_id:
+                    continue
+                version_id = str(attached.get("version_id") or "")
+                row = conn.execute(
+                    platform_documents.select().where(
+                        platform_documents.c.document_id == document_id,
+                    ).with_for_update()
+                ).mappings().first()
+                if (
+                    not row or not version_id
+                    or row["version_id"] != version_id or row["active_version_id"] != version_id
+                    or row["user_id"] != user_id or row["scope_id"] != "public"
+                    or row["status"] in {"RECYCLED", "PURGED"}
+                    or (attached.get("storage_key") and attached["storage_key"] != row["storage_key"])
+                ):
+                    raise ValueError(f"附件 {document_id} 的归属或版本已变化，请重新选择附件")
+                if row["knowledge_type"] == knowledge_type:
+                    continue
+                if row["knowledge_type"]:
+                    raise ValueError(f"附件 {document_id} 已归类为 {row['knowledge_type']}，不能覆盖分类")
+                if (
+                    row["publication_status"] != "UNPUBLISHED"
+                    or row["index_status"] != "NOT_INDEXED"
+                    or any(v.get("publication_status") in {"PUBLISHED", "WITHDRAWN"}
+                           for v in row["version_history"] or [])
+                ):
+                    raise ValueError(f"附件 {document_id} 已有发布或索引记录，不能自动补齐分类")
+                conn.execute(
+                    platform_documents.update().where(
+                        platform_documents.c.document_id == document_id,
+                    ).values(knowledge_type=knowledge_type, updated_at=_now())
+                )
+                updated.append(document_id)
+        return updated
 
     def update_version(
         self, version_id: str, *, status: str | None = None, **fields: Any
@@ -246,6 +313,12 @@ class DocumentLifecycleStore:
             )
             if expected_version is not None and current != expected_version:
                 raise RuntimeError(f"版本 {version_id} 的来源已变化，拒绝写入")
+            if current.get("status") == "PURGED" and (
+                status not in {None, "PURGED"}
+                or changes.get("publication_status", "UNPUBLISHED") != "UNPUBLISHED"
+                or changes.get("index_status", "DELETED") != "DELETED"
+            ):
+                raise ValueError("已删除版本不可恢复或重新发布")
             if "artifact_refs" in changes:
                 changes["artifact_refs"] = {
                     **(current.get("artifact_refs") or {}),
@@ -486,6 +559,27 @@ class DocumentLifecycleStore:
         )
         document["versions"] = self.list_versions(document_id)
         return document
+
+    def is_storage_key_referenced(
+        self, storage_key: str, exclude_version_ids: tuple[str, ...] = ()
+    ) -> bool:
+        """完整检查活动与历史原件引用，不受目录分页或 PURGED 当前行影响。"""
+        history = ("jsonb_array_elements" if self.engine.dialect.name == "postgresql" else "json_each")
+        query = text(f"""
+            SELECT EXISTS (
+                SELECT 1 FROM platform_documents
+                WHERE storage_key = :key AND status <> 'PURGED'
+                  AND version_id NOT IN :excluded
+            ) OR EXISTS (
+                SELECT 1 FROM platform_documents,
+                    {history}(platform_documents.version_history) AS history
+                WHERE history.value->>'storage_key' = :key
+                  AND COALESCE(history.value->>'status', '') <> 'PURGED'
+                  AND history.value->>'version_id' NOT IN :excluded
+            )
+        """).bindparams(bindparam("excluded", expanding=True))
+        with self.engine.connect() as conn:
+            return bool(conn.execute(query, {"key": storage_key, "excluded": exclude_version_ids}).scalar_one())
 
     def list_storage_references(self, *, limit: int = 10000) -> list[dict[str, Any]]:
         """一次性读取存储引用，供后台孤儿扫描使用，避免逐文档加载版本。"""

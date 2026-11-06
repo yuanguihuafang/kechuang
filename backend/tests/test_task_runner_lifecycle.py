@@ -56,13 +56,12 @@ def test_poll_removes_each_completed_task_from_running():
 
 
 def test_async_parse_wrapper_returns_terminal_task_record(monkeypatch):
-    from types import SimpleNamespace
-
     from agents.perception_agent import routes
+    from agents.perception_agent.schemas import PerceptionResult
 
     class TaskStore:
         def __init__(self):
-            self.item = {"task_id": "task-parse"}
+            self.item = {"task_id": "task-parse", "error_code": "UNSUPPORTED_FILE_TYPE"}
 
         def update(self, task_id, **fields):
             self.item.update(fields)
@@ -72,12 +71,13 @@ def test_async_parse_wrapper_returns_terminal_task_record(monkeypatch):
     monkeypatch.setattr(routes, "task_store", store)
 
     async def action():
-        return SimpleNamespace(status="SUCCESS", source_name="file.pdf", error=None)
+        return PerceptionResult(status="SUCCESS", source_name="file.pdf")
 
     result = asyncio.run(routes._run_async_parse("task-parse", "parse", action()))
 
     assert result["status"] == "SUCCEEDED"
     assert store.item["status"] == "SUCCEEDED"
+    assert store.item["error_code"] is None
 
 
 def test_async_index_wrapper_returns_terminal_task_record(monkeypatch):

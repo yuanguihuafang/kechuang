@@ -5,6 +5,24 @@ import pytest
 from admin.service import AdminService
 
 
+@pytest.fixture(autouse=True)
+def isolated_database(monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+
+
+@pytest.mark.parametrize("action", ["publish", "unpublish", "recycle", "restore", "purge"])
+def test_purged_version_cannot_be_operated_on_again(action):
+    from services.application.document_lifecycle import DocumentLifecycleApplicationService
+
+    lifecycle = SimpleNamespace(get_version=lambda _: {
+        "document_id": "doc-1", "version_id": "doc-1:v1", "status": "PURGED",
+        "publication_status": "UNPUBLISHED",
+    })
+    runtime = SimpleNamespace(require_lifecycle=lambda: lifecycle)
+    with pytest.raises(ValueError, match="彻底删除"):
+        asyncio.run(DocumentLifecycleApplicationService(runtime).run_action(action, "doc-1:v1", "admin"))
+
+
 @pytest.mark.parametrize("catalog_exists", [False, True])
 def test_missing_document_version_is_idempotently_purged(catalog_exists):
     deleted_vectors = []

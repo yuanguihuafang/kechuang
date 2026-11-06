@@ -560,6 +560,8 @@ export const api = {
     if (inline) query.set("inline", "true");
     return `${API.GATEWAY}/api/v1/knowledge/documents/${encodeURIComponent(documentId)}/file?${query.toString()}`;
   },
+  adminDocumentFileUrl: (documentId) =>
+    `${API.GATEWAY}/api/v1/admin/documents/${encodeURIComponent(documentId)}/file`,
   adminRecoverTask: (taskId, payload) =>
     request(
       `${API.GATEWAY}/api/v1/admin/tasks/${encodeURIComponent(taskId)}/recover`,

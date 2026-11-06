@@ -281,7 +281,13 @@ def test_save_of_published_draft_preserves_attachment_and_association_metadata(m
         operator_id="owner",
         operator_role="external",
     )
-    service = DraftApplicationService(SimpleNamespace(require_draft_store=lambda: store))
+    service = DraftApplicationService(SimpleNamespace(
+        require_draft_store=lambda: store,
+        require_lifecycle=lambda: SimpleNamespace(
+            get_document=lambda _: {"knowledge_type": "solution"},
+            bind_draft_attachments=lambda items, **kwargs: [] if not items else pytest.fail("published attachment must not be reclassified"),
+        ),
+    ))
 
     saved = asyncio.run(
         service.save(

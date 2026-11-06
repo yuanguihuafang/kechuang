@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-import logging
 import asyncio
+import logging
 import os
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from services.persistence.document_lifecycle import DocumentLifecycleStore
 from services.persistence.retention import (
     PostgresRetentionService,
     cleanup_expired_admin_documents,
@@ -13,13 +17,9 @@ from services.persistence.retention import (
     serialize_storage_references,
     storage_reference_guard,
 )
-from services.persistence.document_lifecycle import DocumentLifecycleStore
 from services.storage.minio.minio_storage import MinioUploadService
-from datetime import datetime, timedelta, timezone
-from typing import Any
 
-
-TEMPORARY_MATERIAL_TTL = timedelta(hours=24)
+TEMPORARY_MATERIAL_TTL = timedelta(days=7)
 SAVED_DRAFT_ATTACHMENT_TTL = timedelta(days=30)
 SAVED_DRAFT_STATUSES = frozenset({"CONFIRMED", "PENDING_REVIEW"})
 logger = logging.getLogger(__name__)
@@ -124,7 +124,7 @@ def has_expired_attachment(draft: dict[str, Any] | None) -> bool:
 
 
 def retain_draft_attachments(draft: dict[str, Any]) -> dict[str, Any]:
-    """保存草稿后移除临时标记，后续不再参与 24 小时清理。"""
+    """保存草稿后移除临时标记，后续不再参与 7 天临时附件清理。"""
     retained = dict(draft)
     retained["attachments"] = [
         {key: value for key, value in item.items() if key not in {"temporary", "expires_at"}}
@@ -351,12 +351,10 @@ async def cleanup_temporary_materials(runtime: Any, retention_stop: asyncio.Even
                     )
                 except Exception:
                     logger.exception("管理台企业/专家文档过期清理失败")
-                saved_documents = {
-                    str(item.get("document_id") or "")
-                    for item in all_drafts
-                    for attachment in (item.get("draft") or {}).get("attachments") or []
-                    if isinstance(attachment, dict) and attachment.get("document_id")
-                }
+                saved_references = collect_storage_references(
+                    documents=(), drafts=all_drafts, tasks=()
+                )
+                protected_documents = saved_references.document_ids | published_document_ids
                 for task in _all_cleanup_pages(
                     runtime.task_store.list_page, operation="user_draft"
                 ):
@@ -367,7 +365,8 @@ async def cleanup_temporary_materials(runtime: Any, retention_stop: asyncio.Even
                         item
                         for item in attachments
                         if is_expired_attachment(item)
-                        and str(item.get("document_id") or "") not in saved_documents
+                        and str(item.get("document_id") or "") not in protected_documents
+                        and str(item.get("storage_key") or "") not in saved_references.storage_keys
                     ]
                     cleanup_failed = False
                     for item in expired:
@@ -387,7 +386,7 @@ async def cleanup_temporary_materials(runtime: Any, retention_stop: asyncio.Even
                             task["task_id"],
                             status="EXPIRED",
                             stage="expired",
-                            error="临时附件已超过 24 小时，原文件及解析产物已清理",
+                            error="临时附件已超过 7 天，原文件及解析产物已清理",
                         )
                 await _cleanup_saved_draft_attachments(
                     runtime.draft_store_service,

@@ -8,11 +8,11 @@
 
 ## 当前工作区与执行状态
 
-- 2026-09-29：本机 OPIE 自定义 MCP 拦截器已修复请求级 secrets 读取，并通过真实草稿创建、知识检索验证；服务器尚未部署，见[修复记录](方案/DeerFlow-MCP运行时注入修复.md)。
+- 历史记录（2026-09-29）：本机 OPIE 自定义 MCP 拦截器修复及验证见[修复记录](方案/DeerFlow-MCP运行时注入修复.md)；其中部署状态只代表当时，当前状态需现场核验。
 
-- 当前唯一工作区：`D:\Work\kechuang`。
+- 科创业务项目工作区为 `D:\Work\kechuang`；独立只读知识库 MCP 位于 `D:\Work\kechuang-knowledge-mcp`，不随业务后端启动，工具和接入说明见该项目的 `kechuang-MCP.md`。调用方可自行选择内外部查询模式，这不是身份认证，应限制网络访问范围。
 - `D:\Work\kc-rag-agent` 仅作为历史参考，禁止写入、清理或同步覆盖。
-- 线上分工：3090 运行 DeerFlow/OPIEos Gateway（`27.223.9.106:8199`），4090 运行科创 Backend/前端（`27.223.9.106:8793` / `:8794`）；4090 Backend 回调 3090 Gateway，3090 再访问 4090 `/mcp/`。部署步骤见[双服务器迁移部署](方案/科创与DeerFlow双服务器迁移部署.md)。
+- 双服务器部署方案为 3090 运行 DeerFlow/OPIEos Gateway、4090 运行科创 Backend/前端；地址和实际运行状态需按部署环境核验。步骤见[双服务器迁移部署](科创与DeerFlow双服务器迁移部署.md)。
 - 源码中的 13 个业务 Skill 位于 `OPIEos/skills/public/kc-*`；实际运行加载位置由部署中的 `skills.path`、容器挂载及 Agent 白名单共同决定。迁移时先核对 Gateway 的有效配置，不从旧 `skills/custom` 文档路径推断当前部署。
 - Skill 不硬编码宿主机路径；通过 DeerFlow 配置映射 Skill 根目录。
 - 前端仍以 `/api/v1/*` 为唯一业务入口，优先保持现有请求字段、Token-only 身份、`thread_id` 和五类 SSE 事件不变。
@@ -35,13 +35,12 @@
 | [意图路由与Skill拆分方案](方案/意图路由与Skill拆分方案.md) | `kechuang` Agent 常驻指令与各业务 Skill 的职责和调用规则 |
 | [问答界面功能说明](前端API/问答界面功能说明.md) | 小程序问答、SSE、草稿发布/下架/删除、图片展示与个人中心 API 契约 |
 | [前后端API接口文档](前后端API接口文档.md) | 后端接口和前后端联调说明 |
-| [前端页面交付说明](前端API/前端页面交付说明.md) | 测试界面的页面交互和交付边界 |
 | Backend 模块与入口 | 下方“Backend 模块与主要入口” |
 | [Milvus 连接生命周期设计](superpowers/specs/2026-09-27-milvus-connection-lifecycle-design.md) | 检索 Agent、Collection 连接共享、恢复与 Backend 关闭边界 |
 | [PostgreSQL 连接池预算与生命周期](superpowers/specs/2026-09-27-postgres-pool-lifecycle.md) | PostgreSQL 池上限、worker 预算与 Backend 关闭边界 |
 | 历史迁移、计划与设计稿 | [并行迁移计划](superpowers/plans/2026-09-22-deerflow-parallel-migration.md)、[宿主机运行计划](superpowers/plans/2026-09-23-host-backend-deerflow-runtime.md)及其[设计稿](superpowers/specs/2026-09-23-host-backend-deerflow-runtime.md)、[旧 Agent 隔离计划](superpowers/plans/2026-09-23-kechuang-agent-isolation.md)及其[设计稿](superpowers/specs/2026-09-23-kechuang-agent-isolation-design.md)、[后端加固计划](superpowers/plans/2026-09-24-kechuang-backend-flow-hardening.md)及其[设计稿](superpowers/specs/2026-09-24-kechuang-backend-flow-hardening-design.md)；均为历史执行/设计记录，当前状态以迁移方案为准 |
 
-后端 API 的详细接口以 [`前后端API接口文档.md`](前后端API接口文档.md) 为准；页面交互以 [`前端页面交付说明.md`](前端API/前端页面交付说明.md) 为准。
+后端 API 的详细接口见[前后端 API 接口文档](前后端API接口文档.md)；问答与个人中心交互见[问答界面功能说明](前端API/问答界面功能说明.md)。其他测试页面以当前实现为准。
 
 ## Backend 模块与主要入口
 
@@ -133,7 +132,7 @@ npm run dev
 |---|---|---|
 | `DEERFLOW_ENABLED` | `true` | 将问答执行切到 DeerFlow 适配器 |
 | `DEERFLOW_BASE_URL` | `http://127.0.0.1:8001` | 业务 backend 调用本机 Gateway 进程 |
-| `DEERFLOW_INTERNAL_AUTH_TOKEN` | 与 DeerFlow `DEER_FLOW_INTERNAL_AUTH_TOKEN` 相同 | backend 调用 Gateway 的内部认证，不提交 Git |
+| `DEER_FLOW_INTERNAL_AUTH_TOKEN` | 与 DeerFlow 端同名配置的值相同 | backend 调用 Gateway 的内部认证，不提交 Git |
 | `KC_MCP_ENABLED` | `true` | 暴露业务 MCP |
 | `KC_MCP_PATH` | `/mcp` | MCP 地址为 `http://localhost:8793/mcp/` |
 | `KC_MCP_ALLOWED_HOSTS` | 包含 `host.docker.internal:*` | 允许 Docker DeerFlow 回调宿主机 backend |
@@ -164,7 +163,7 @@ DeerFlow 侧的映射分成两处：
 DEERFLOW_ENABLED=true
 DEERFLOW_BASE_URL=http://<deerflow-host>:<gateway-port>
 # DeerFlow 内部调用认证；必须与 DeerFlow 的 DEER_FLOW_INTERNAL_AUTH_TOKEN 相同
-DEERFLOW_INTERNAL_AUTH_TOKEN=<runtime-secret>
+DEER_FLOW_INTERNAL_AUTH_TOKEN=<runtime-secret>
 # 如果服务器 Gateway 另要求 Bearer/PAT/JWT，再设置；不要提交到 Git
 DEERFLOW_API_KEY=<runtime-secret>
 

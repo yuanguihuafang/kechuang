@@ -8,6 +8,7 @@ import json
 import logging
 import re
 from typing import Any
+from urllib.parse import unquote
 
 from fastapi import HTTPException
 from pydantic import ValidationError
@@ -423,6 +424,14 @@ class DraftPublishingApplicationService:
                 continue
             version_id = str(attached.get("version_id") or "")
             document = lifecycle.get_document(document_id) if document_id and lifecycle else None
+            if document and not document.get("knowledge_type"):
+                try:
+                    lifecycle.bind_draft_attachments(
+                        [attached], user_id=user_id, knowledge_type=draft_record["draft_type"],
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                document = lifecycle.get_document(document_id)
             version = lifecycle.get_version(version_id) if version_id and lifecycle else None
             active_version = (document or {}).get("active_version") or {}
             if (
@@ -432,6 +441,10 @@ class DraftPublishingApplicationService:
                 or document.get("user_id") != user_id
                 or document.get("scope_id") != "public"
                 or document.get("knowledge_type") != draft_record.get("draft_type")
+                or (
+                    attached.get("storage_key")
+                    and str(attached["storage_key"]) != str(version.get("storage_key") or "")
+                )
                 or str(version.get("status") or "") in {"RECYCLED", "PURGED"}
             ):
                 raise HTTPException(

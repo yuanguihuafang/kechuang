@@ -124,12 +124,14 @@ def test_paddleocr_settings_are_read_from_environment(monkeypatch):
     assert settings.paddleocr_job_url == "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
 
 
-def test_paddleocr_parser_submits_polls_and_parses_api_result(monkeypatch, tmp_path):
+@pytest.mark.parametrize("page_count", [1, 72])
+def test_paddleocr_parser_submits_polls_and_parses_api_result(monkeypatch, tmp_path, page_count):
     jsonl = json.dumps(
         {
             "result": {
                 "ocrResults": [
-                    {"prunedResult": {"rec_texts": ["图片识别文本"]}},
+                    {"prunedResult": {"rec_texts": ["图片识别文本"]}}
+                    for _ in range(page_count)
                 ]
             }
         },
@@ -153,7 +155,7 @@ def test_paddleocr_parser_submits_polls_and_parses_api_result(monkeypatch, tmp_p
                     "code": 0,
                     "data": {
                         "state": "done",
-                        "extractProgress": {"totalPages": 1},
+                        "extractProgress": {"totalPages": page_count},
                         "resultUrl": {"jsonUrl": "https://result.example/result.jsonl"},
                     },
                 },
@@ -173,8 +175,9 @@ def test_paddleocr_parser_submits_polls_and_parses_api_result(monkeypatch, tmp_p
 
     result = asyncio.run(parser.parse(path))
 
-    assert result.text == "图片识别文本"
-    assert result.page_texts == {1: "图片识别文本"}
+    assert result.text == "\n\n".join(["图片识别文本"] * page_count)
+    assert result.page_texts == {page: "图片识别文本" for page in range(1, page_count + 1)}
+    assert result.metadata["page_count"] == page_count
     assert result.metadata["parser"] == "paddleocr"
     assert calls == [
         ("POST", "https://paddleocr.example/api/v2/ocr/jobs"),

@@ -7,6 +7,11 @@ from admin.service import AdminService
 from services.application.document_lifecycle import _recover_lifecycle
 
 
+@pytest.fixture(autouse=True)
+def isolated_database(monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+
+
 def runtime_for_purge(*, linked_status="PUBLISHED", fail_once=False):
     effects = []
     linked = {"draft_id": "d", "user_id": "u", "status": linked_status,
@@ -22,8 +27,11 @@ def runtime_for_purge(*, linked_status="PUBLISHED", fail_once=False):
         def list_versions(self, document_id):
             return [version]
 
+        def is_storage_key_referenced(self, storage_key, *, exclude_version_ids=()):
+            return False
+
         def get_document(self, document_id, **kwargs):
-            return {"knowledge_type": "solution"}
+            return {"knowledge_type": "solution", "active_version_id": "doc:v1"}
 
         def update_version(self, version_id, **fields):
             if failures[0]:
@@ -167,7 +175,7 @@ def test_version_purge_keeps_other_live_version_artifacts_and_drafts():
     runtime.embedded_perception.delete_original_file = original
     result, _ = asyncio.run(AdminService(runtime).lifecycle_action("purge", "doc:v1", "admin"))
     assert result["status"] == "PURGED"
-    assert effects == ["vector", "original-only"]
+    assert effects == ["original-only"]
     assert linked["status"] == "WITHDRAWN"
 
 

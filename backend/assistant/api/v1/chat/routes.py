@@ -13,6 +13,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
 from assistant.api.v1.identity.dependencies import require_request_user_id
+from core.contracts.errors import ErrorCode
 from runtime.container import GatewayRuntime
 
 logger = logging.getLogger(__name__)
@@ -271,8 +272,15 @@ def build_chat_router(runtime: GatewayRuntime, resolve_effective_identity: Any) 
                             )
                 result = task.result()
             except HTTPException as exc:
-                detail = exc.detail if isinstance(exc.detail, str) else "文件处理失败，请稍后重试。"
+                error_detail = exc.detail if isinstance(exc.detail, dict) else {}
+                error_code = error_detail.get("error_code") or error_detail.get("code")
+                detail = (
+                    exc.detail if isinstance(exc.detail, str)
+                    else error_detail.get("message", "文件处理失败，请稍后重试。")
+                )
                 stage = "processing" if request.state.material_parse_completed else "parse"
+                if error_code == ErrorCode.UNSUPPORTED_FILE_TYPE:
+                    stage = "upload"
                 public_message = (
                     detail
                     if exc.status_code < 500
@@ -286,6 +294,7 @@ def build_chat_router(runtime: GatewayRuntime, resolve_effective_identity: Any) 
                     "error",
                     {
                         "code": exc.status_code,
+                        **({"error_code": error_code} if error_code else {}),
                         "stage": stage,
                         "message": public_message,
                     },

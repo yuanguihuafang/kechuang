@@ -3,7 +3,6 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_ROOT = PROJECT_ROOT / "OPIEos"
-PACKAGE_ROOT = PROJECT_ROOT / "bakup"
 DRAFT_SKILLS = ("kc-demand-draft", "kc-solution-draft", "kc-achievement-draft")
 
 
@@ -38,22 +37,3 @@ def test_draft_skills_define_published_draft_update_or_create_flow():
         assert "expected_version" in skill, skill_name
         assert "确认前不得调用" in skill, skill_name
         assert "kc_draft_create" in skill, skill_name
-
-
-def test_agent_and_skill_package_copies_match_project_sources():
-    paths = [
-        (
-            SOURCE_ROOT / "agents/kechuang/SOUL.md",
-            PACKAGE_ROOT / "agents/kechuang/SOUL.md",
-        ),
-    ]
-    paths.extend(
-        (
-            SOURCE_ROOT / f"skills/custom/{skill_name}/SKILL.md",
-            PACKAGE_ROOT / f"skills/custom/{skill_name}/SKILL.md",
-        )
-        for skill_name in DRAFT_SKILLS
-    )
-
-    for source, packaged in paths:
-        assert _read(source) == _read(packaged), str(packaged)

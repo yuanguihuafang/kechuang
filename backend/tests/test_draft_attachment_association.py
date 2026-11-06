@@ -115,6 +115,7 @@ def test_create_draft_binds_only_current_users_session_upload_attachments(monkey
         require_draft_store=lambda: store,
         require_file_workflow=lambda: SimpleNamespace(task_store=TaskStore()),
         require_conversation=lambda: None,
+        require_lifecycle=lambda: SimpleNamespace(get_document=lambda _: {"knowledge_type": "demand"}),
     )
     endpoint = next(
         route.endpoint
@@ -160,7 +161,10 @@ def test_update_draft_replaces_only_explicit_attachment_list(
         user_role="external",
         draft={"draft_type": "demand", "title": "需求", "attachments": [existing_attachment]},
     )
-    runtime = SimpleNamespace(require_draft_store=lambda: store, require_conversation=lambda: None)
+    runtime = SimpleNamespace(
+        require_draft_store=lambda: store, require_conversation=lambda: None,
+        require_lifecycle=lambda: SimpleNamespace(get_document=lambda _: {"knowledge_type": "demand"}),
+    )
     endpoint = next(
         route.endpoint
         for route in build_draft_router(runtime, lambda user_id: (user_id, "external", None)).routes

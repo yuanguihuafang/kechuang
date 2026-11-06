@@ -15,7 +15,9 @@
 
 聊天运行流是 OPIEos Gateway 的 HTTP/SSE API，不是 MCP Streamable HTTP。前端只访问科创业务 API，不直接访问 DeerFlow Gateway 或 MCP。后端对前端继续使用既有 `start`、`progress`、`token`、`done`、`error` 五类 SSE 事件；MCP `/mcp/` 是独立的工具通道。
 
-本机 `kechuang` Agent 源码资产位于 `OPIEos/agents/kechuang/`，运行副本按 Agent owner UUID 加载（本机为 `62ddcc4d-f2b5-4152-be26-78a1a7554a86`，位于 `DEER_FLOW_HOME/users/<UUID>/agents/kechuang/`）。13 个 `kc-*` Skill 位于 `skills/public`，Agent 白名单限定发现范围。线上由 3090 运行 DeerFlow Gateway、4090 运行科创 Backend；两端通过配置连接，MCP 业务身份由 Backend 根据会话恢复，MCP 只传递会话与 trace 上下文。Gateway 不提供 Agent 级 MCP 工具隔离，数据权限由 Backend 校验。见[双服务器部署步骤](docs/方案/科创与DeerFlow双服务器迁移部署.md)、[迁移方案](docs/方案/DeerFlow迁移与Skill接入方案.md)和[OPIEos 修改记录](docs/方案/OPIEos-main修改记录.md)。
+`kechuang` Agent 资产位于 `OPIEos/agents/kechuang/`，运行副本和 Skill 加载路径以部署环境的 owner、配置及挂载为准。科创 Backend 与 DeerFlow 通过配置连接，科创业务 MCP 的身份由 Backend 根据会话恢复。Gateway 不提供 Agent 级 MCP 工具隔离，数据权限由 Backend 校验。见[双服务器部署步骤](docs/科创与DeerFlow双服务器迁移部署.md)、[迁移方案](docs/方案/DeerFlow迁移与Skill接入方案.md)和[OPIEos 修改记录](docs/方案/OPIEos-main修改记录.md)。
+
+另有独立的只读知识库 MCP 项目 `D:\Work\kechuang-knowledge-mcp`，不随本后端自动启动，也不是本后端的数据访问必经层；其六个工具和部署说明见该项目的 `kechuang-MCP.md`。它允许调用方自行选择内外部查询模式，这不是身份认证，部署时应限制网络访问范围。
 
 问答只运行 DeerFlow；旧科创意图/规划/推理/Supervisor 执行图已删除，无配置时明确返回 503。会话状态在 `services/application/conversation_state.py`，共享合同在 `core/contracts`，资料处理和管理服务仍归业务后端。
 
@@ -38,7 +40,6 @@
 - [DeerFlow 迁移与 Skill 接入方案](docs/方案/DeerFlow迁移与Skill接入方案.md)
 - [前后端 API 接口文档](docs/前后端API接口文档.md)
 - [问答界面前端契约](docs/前端API/问答界面功能说明.md)
-- [前端页面交付说明](docs/前端API/前端页面交付说明.md)
 - [意图路由与 Skill 拆分方案](docs/方案/意图路由与Skill拆分方案.md)
 
-`D:\Work\kc-rag-agent` 是旧的独立项目，保留但不作为当前工作区；所有当前修改只在 `D:\Work\kechuang`。
+`D:\Work\kc-rag-agent` 是旧的独立项目，仅供历史参考；独立只读知识库 MCP 位于 `D:\Work\kechuang-knowledge-mcp`，与本仓库分别维护。

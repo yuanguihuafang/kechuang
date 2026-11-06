@@ -404,6 +404,9 @@ def test_save_rejects_fields_from_another_type_of_owned_draft(field_container):
 
 def test_publish_uses_existing_service_and_requires_owner():
     class Retrieval:
+        async def preflight_publish_document(self, _draft_id, _payload):
+            return None
+
         async def publish_document(self, _draft_id, _payload):
             return SimpleNamespace(
                 status="SUCCESS",

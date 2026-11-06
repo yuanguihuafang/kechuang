@@ -157,10 +157,12 @@ def test_lifecycle_recovery_handles_admin_restore_and_recycle(
 
     class Lifecycle:
         def get_version(self, _version_id):
-            return {"document_id": "doc-1", "scope_id": "public", "knowledge_type": "demand", "status": "RECYCLED"}
+            return {"document_id": "doc-1", "version_id": "doc-1:v1", "scope_id": "public",
+                    "knowledge_type": "demand", "status": "RECYCLED", "index_status": "INDEXED",
+                    "indexed_count": 1, "storage_key": "uploads/doc.pdf"}
 
         def get_document(self, document_id, **kwargs):
-            return {"document_id": document_id, "knowledge_type": "demand"}
+            return {"document_id": document_id, "knowledge_type": "demand", "active_version_id": "doc-1:v1"}
 
         def update_version(self, version_id, **fields):
             calls.append(("update", version_id, fields))
@@ -169,11 +171,14 @@ def test_lifecycle_recovery_handles_admin_restore_and_recycle(
     class Retrieval:
         async def republish_document(self, *_args):
             calls.append(("republish",))
-            return SimpleNamespace(status="SUCCESS", model_dump=lambda: {})
+            return SimpleNamespace(status="SUCCESS", indexed_count=1, model_dump=lambda: {})
 
         async def unpublish_document(self, *_args):
             calls.append(("unpublish",))
-            return SimpleNamespace(status="SUCCESS", model_dump=lambda: {})
+            return SimpleNamespace(status="SUCCESS", indexed_count=1, model_dump=lambda: {})
+
+    async def inspect(_key):
+        return {"size": 1}
 
     runtime = SimpleNamespace(
         lifecycle_service=Lifecycle(),
@@ -181,6 +186,7 @@ def test_lifecycle_recovery_handles_admin_restore_and_recycle(
         task_store=None, outbox_repository=None,
         embedded_retrieval=SimpleNamespace(agent=Retrieval()),
         embedded_perception=SimpleNamespace(delete_stored_document_internal=None),
+        storage_service=SimpleNamespace(inspect_object=inspect),
     )
 
     asyncio.run(
@@ -201,16 +207,18 @@ def test_admin_recycle_repairs_legacy_empty_knowledge_type():
 
     class Lifecycle:
         def get_version(self, _version_id):
-            return {"document_id": "doc-1", "scope_id": "public", "knowledge_type": ""}
+            return {"document_id": "doc-1", "version_id": "doc-1:v1", "scope_id": "public",
+                    "knowledge_type": "", "status": "PUBLISHED", "index_status": "INDEXED", "indexed_count": 1}
 
         def get_document(self, _document_id, include_purged=True):
-            return {"knowledge_type": ""}
+            return {"knowledge_type": "", "active_version_id": "doc-1:v1"}
 
         def update_version(self, version_id, **fields):
             return {"version_id": version_id, **fields}
 
     class Result:
         status = "SUCCESS"
+        indexed_count = 1
 
         def model_dump(self):
             return {}
@@ -274,9 +282,13 @@ def test_lifecycle_recovery_purge_uses_internal_storage_delete():
     deleted = []
 
     class Lifecycle:
+        def is_storage_key_referenced(self, storage_key, *, exclude_version_ids=()):
+            return False
+
         def get_version(self, _version_id):
             return {
                 "document_id": "doc-1",
+                "version_id": "doc-1:v1",
                 "storage_key": "uploads/doc.pdf",
                 "scope_id": "public",
                 "knowledge_type": "demand",
@@ -287,7 +299,7 @@ def test_lifecycle_recovery_purge_uses_internal_storage_delete():
             return [{"version_id": "doc-1:v1", **self.get_version("doc-1:v1")}]
 
         def get_document(self, document_id, **kwargs):
-            return {"document_id": document_id, "knowledge_type": "demand"}
+            return {"document_id": document_id, "knowledge_type": "demand", "active_version_id": "doc-1:v1"}
 
         def update_version(self, version_id, **fields):
             return {"version_id": version_id, **fields}
@@ -303,7 +315,9 @@ def test_lifecycle_recovery_purge_uses_internal_storage_delete():
     runtime = SimpleNamespace(
         lifecycle_service=Lifecycle(),
         require_lifecycle=lambda: Lifecycle(),
-        require_draft_store=lambda: SimpleNamespace(list_for_document=lambda document_id: []),
+        require_draft_store=lambda: SimpleNamespace(
+            list_for_document=lambda document_id: [], list_storage_key_references=lambda key: [],
+        ),
         task_store=None, outbox_repository=None,
         embedded_retrieval=SimpleNamespace(agent=Retrieval()),
         embedded_perception=Perception(),
@@ -686,7 +700,7 @@ def test_mineru_images_follow_page_order(tmp_path):
     assert [item["relativePath"] for item in assets] == ["images/first.png", "images/second.png"]
 
 
-def test_replacing_same_lifecycle_version_only_removes_old_original():
+def test_replacing_same_lifecycle_version_does_not_remove_any_original():
     deleted = []
 
     class Storage:
@@ -715,8 +729,8 @@ def test_replacing_same_lifecycle_version_only_removes_old_original():
         )
     )
 
-    assert result == {"status": "DELETED", "storage_key": "uploads/old.pdf"}
-    assert deleted == ["uploads/old.pdf"]
+    assert result["status"] == "SKIPPED"
+    assert deleted == []
 
 
 def test_parse_result_persists_saved_chunks(monkeypatch):

@@ -72,3 +72,39 @@ def test_external_can_delete_only_own_attachment_and_admin_is_allowed():
         user_role="internal", user_id="admin", document_id="doc-1",
         storage_key="uploads/doc-1", records=[],
     )
+
+
+def test_admin_downloads_current_unpublished_file_without_user_login():
+    from types import SimpleNamespace
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from assistant.api.v1.documents.catalog import build_documents_router
+
+    calls = []
+    version = {"document_id": "doc-1", "status": "PARSED", "scope_id": "private",
+               "publication_status": "UNPUBLISHED", "storage_key": "uploads/current.pdf"}
+
+    async def download_file(key):
+        calls.append(key)
+        return b"pdf-content", "application/pdf", "current.pdf"
+
+    runtime = SimpleNamespace(
+        require_lifecycle=lambda: SimpleNamespace(list_versions=lambda _: [version]),
+        storage_service=SimpleNamespace(download_file=download_file),
+    )
+    app = FastAPI()
+    app.include_router(build_documents_router(runtime, object()))
+    client = TestClient(app)
+    public = client.get("/api/v1/knowledge/documents/doc-1/file?user_id=admin")
+    assert public.status_code == 403
+    assert calls == []
+    admin = client.get("/api/v1/admin/documents/doc-1/file?inline=true")
+    assert admin.status_code == 200
+    assert admin.content == b"pdf-content"
+    assert admin.headers["content-disposition"].startswith("inline;")
+    assert calls == ["uploads/current.pdf"]
+    # A removed current version must never fall back to a historical original.
+    for status in ("PURGED", "RECYCLED"):
+        version["status"] = status
+        assert client.get("/api/v1/admin/documents/doc-1/file").status_code == 404
+    assert calls == ["uploads/current.pdf"]

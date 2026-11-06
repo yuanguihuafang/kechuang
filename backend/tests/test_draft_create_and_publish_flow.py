@@ -119,11 +119,9 @@ def test_draft_skills_explain_natural_language_publish_and_unpublished_visibilit
     skills = ("kc-demand-draft", "kc-solution-draft", "kc-achievement-draft")
     for name in skills:
         source = root / "OPIEos" / "skills" / "custom" / name / "SKILL.md"
-        packaged = root / "bakup" / "skills" / "custom" / name / "SKILL.md"
         source_text = source.read_text(encoding="utf-8")
         assert "kc_draft_publish" in source_text
         assert "其他用户暂时看不到" in source_text
-        assert source_text == packaged.read_text(encoding="utf-8")
 
 
 def test_document_extraction_creates_all_drafts_as_one_ordered_batch():

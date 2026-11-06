@@ -37,6 +37,24 @@ class DraftApplicationService:
     def __init__(self, runtime: Any) -> None:
         self.runtime = runtime
 
+    def _bind_attachment_types(self, draft: dict[str, Any], user_id: str) -> None:
+        attachments = [item for item in draft.get("attachments") or [] if isinstance(item, dict)]
+        if attachments and draft.get("draft_type") in {"demand", "solution", "achievement"}:
+            lifecycle = self.runtime.require_lifecycle()
+            untyped = []
+            for attached in attachments:
+                document = lifecycle.get_document(str(attached.get("document_id") or ""))
+                if document and not document.get("knowledge_type"):
+                    untyped.append(attached)
+            if not untyped:
+                return
+            try:
+                lifecycle.bind_draft_attachments(
+                    untyped, user_id=user_id, knowledge_type=draft["draft_type"],
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     def owned_draft(self, draft_id: str, context: ToolContext) -> dict[str, Any]:
         result = self.runtime.require_draft_store().get(draft_id, user_id=context.user_id)
         if result is None or result.get("status") == "DELETED":
@@ -85,6 +103,7 @@ class DraftApplicationService:
             )
         if has_expired_attachment(draft):
             raise HTTPException(status_code=410, detail="草稿及文档已过期，请重新上传文档")
+        self._bind_attachment_types(draft, user_id)
         result = self.runtime.require_draft_store().create(
             draft=retain_draft_attachments(draft),
             thread_id=context.thread_id,
@@ -110,7 +129,6 @@ class DraftApplicationService:
         return result
 
     async def get(self, draft_id: str, *, context: ToolContext) -> dict[str, Any]:
-        user_id = context.user_id
         result = self.owned_draft(draft_id, context)
         if has_expired_attachment(result.get("draft") or {}):
             raise HTTPException(status_code=410, detail="草稿及文档已过期，请重新上传文档")
@@ -199,6 +217,7 @@ class DraftApplicationService:
             update_kwargs["replace_fields"] = True
         if expected_version is not None:
             update_kwargs["expected_version"] = expected_version
+        self._bind_attachment_types(draft_to_save, user_id)
         try:
             result = self.runtime.require_draft_store().update(draft_id, **update_kwargs)
         except ValueError as exc:

@@ -45,6 +45,7 @@ def _cleanup_superseded_source_drafts(
     *,
     source_id: str | None,
     document_id: str | None = None,
+    previous_version_id: str | None = None,
     user_id: str,
     draft_type: str,
     retained_draft_ids: set[str],
@@ -70,32 +71,40 @@ def _cleanup_superseded_source_drafts(
             for row in store.list_for_document(document_id)
             if isinstance(row, dict) and row.get("draft_id")
         })
-    group = [
+    retained = [row for row in rows.values() if str(row.get("draft_id")) in retained_draft_ids]
+    created_at = [str(row["created_at"]) for row in retained if row.get("created_at")]
+    cutoff = min(created_at) if len(created_at) == len(retained) and created_at else None
+
+    def superseded(row: dict[str, Any]) -> bool:
+        draft = row.get("draft") or {}
+        attachments = [item for item in draft.get("attachments") or [] if isinstance(item, dict)]
+        if document_id:
+            linked_ids = {str(item["document_id"]) for item in attachments if item.get("document_id")}
+            if row.get("source_document_id"):
+                linked_ids.add(str(row["source_document_id"]))
+            if linked_ids != {document_id}:
+                return False
+        same_source = canonical_source_id(draft.get("source_id")) == source_id
+        if same_source:
+            return bool(cutoff and row.get("created_at") and str(row["created_at"]) < cutoff)
+        return bool(document_id and previous_version_id and attachments and all(
+            item.get("document_id") == document_id
+            and item.get("version_id") == previous_version_id
+            for item in attachments
+        ))
+
+    stale = [
         row for row in rows.values()
         if row.get("user_id") == user_id
         and row.get("draft_type") == draft_type
-        and row.get("status") != "DELETED"
-        and (
-            canonical_source_id((row.get("draft") or {}).get("source_id")) == source_id
-            or (
-                document_id
-                and (
-                    str(row.get("source_document_id") or "") == document_id
-                    or any(
-                        isinstance(attachment, dict)
-                        and str(attachment.get("document_id") or "") == document_id
-                        for attachment in (row.get("draft") or {}).get("attachments", [])
-                    )
-                )
-            )
-        )
+        and row.get("status") == "PUBLISHED"
+        and str(row.get("draft_id")) not in retained_draft_ids
+        and superseded(row)
     ]
-    retained = [row for row in group if str(row.get("draft_id")) in retained_draft_ids]
     retained_mysql_ids = {
         str((row.get("draft") or {}).get("mysql_record_id") or "").strip()
         for row in retained
     } - {""}
-    stale = [row for row in group if str(row.get("draft_id")) not in retained_draft_ids]
     stale_mysql_ids = {
         str((row.get("draft") or {}).get("mysql_record_id") or "").strip()
         for row in stale
@@ -108,7 +117,9 @@ def _cleanup_superseded_source_drafts(
     deleted_mysql_ids: set[str] = set()
     deleted_mysql_count = 0
     for mysql_id in sorted(stale_mysql_ids):
-        references = store.list_business_references(draft_type, mysql_id, user_id=user_id)
+        references = store.list_business_references(
+            draft_type, mysql_id, user_id=user_id if draft_type == "customer_visit" else None,
+        )
         if any(str(row.get("draft_id") or "") not in stale_draft_ids for row in references):
             continue
         if target is None or not callable(getattr(target, "delete_by_mysql_id", None)):
@@ -277,7 +288,8 @@ class AdminDocumentMixin:
             if action not in {"publish", "unpublish", "recycle", "restore", "purge"}:
                 raise ValueError("补偿任务动作不受支持")
             result, updated = await self.lifecycle_action(
-                action, str(task.get("version_id") or ""), payload.operator_id, task=task
+                action, str(task.get("version_id") or ""), payload.operator_id, task=task,
+                direct_delete=bool((task.get("compensation") or {}).get("direct_delete")),
             )
             if result is None:
                 raise RuntimeError("补偿重试失败")
@@ -292,14 +304,27 @@ class AdminDocumentMixin:
             "该任务不属于文档生命周期补偿，请使用对应文件任务恢复入口或重新提交业务请求"
         )
 
+    @serialize_storage_references
     async def delete_document(
         self, document_id: str, payload: UnifiedDeleteRequest
     ) -> dict[str, object]:
-        if self.runtime.tool_adapter is None:
-            raise RuntimeError("Supervisor Tool Adapter 尚未就绪")
-        return await self.runtime.tool_adapter.delete_document(
-            {"document_id": document_id, **payload.model_dump()}
-        )
+        store = self.runtime.require_lifecycle()
+        document = store.get_document(document_id, include_purged=True)
+        version_id = (document or {}).get("active_version_id")
+        if version_id:
+            result, task = await self.lifecycle_action(
+                "purge", str(version_id), str(payload.user_id or "admin"), direct_delete=True,
+            )
+        else:
+            if any(row.get("status") != "PURGED" for row in store.list_versions(document_id)):
+                raise ValueError("文档缺少活动版本，请刷新目录后重试")
+            result, task = await self._purge_missing_document(document_id), None
+        if result is None:
+            raise RuntimeError("文档删除失败")
+        return {
+            **result, "status": "DELETED",
+            **({"task_id": task["task_id"]} if task else {}),
+        }
 
     async def parse_task(self, task_id: str) -> dict[str, Any]:
         workflow = self.runtime.require_file_workflow()
@@ -356,6 +381,12 @@ class AdminDocumentMixin:
         task = workflow.status(task_id)
         if task is None:
             raise LookupError("Supervisor 编排任务不存在")
+        try:
+            workflow.validate_task_source(task)
+        except ValueError as exc:
+            if str(exc) != "STALE_SOURCE":
+                raise
+            return {**task, "error_code": "STALE_SOURCE", "error": "任务引用的附件版本已失效，请从当前文档重新操作"}
         if task.get("status") in {"QUEUED", "RUNNING", "PARSING"}:
             return task
         if task.get("status") not in {"WAITING_CONFIRM", "WAITING_DRAFT_CONFIRM", "SUCCEEDED"}:
@@ -398,8 +429,20 @@ class AdminDocumentMixin:
         task = workflow.status(task_id)
         if task is None:
             raise LookupError("Supervisor 编排任务不存在")
+        try:
+            workflow.validate_task_source(task)
+        except ValueError as exc:
+            if str(exc) != "STALE_SOURCE":
+                raise
+            return {**task, "error_code": "STALE_SOURCE", "error": "任务引用的附件版本已失效，请从当前文档重新操作"}
         if task.get("status") in {"QUEUED", "RUNNING", "INDEXING"}:
             return task
+        if task.get("draft_status") == "RUNNING":
+            return {**task, "error_code": "INVALID_STAGE", "error": "字段提取进行中，暂不能确认发布"}
+        if task.get("status") not in {"WAITING_CONFIRM", "WAITING_DRAFT_CONFIRM", "SUCCEEDED"} and not (
+            task.get("status") == "FAILED" and task.get("preview_blocks") and task.get("storage_key")
+        ):
+            return {**task, "error_code": "INVALID_STAGE", "error": "当前任务不是待确认状态"}
         if task.get("status") == "SUCCEEDED" and task.get("storage_key"):
             task = (
                 workflow.task_store.update(
@@ -561,6 +604,7 @@ class AdminDocumentMixin:
                     self.runtime,
                     source_id=source_draft.get("source_id"),
                     document_id=str(task.get("document_id") or "") or None,
+                    previous_version_id=str(task.get("previous_version_id") or "") or None,
                     user_id=str(task.get("user_id") or "admin"),
                     draft_type=str(source_record.get("draft_type") or task.get("knowledge_type") or "solution"),
                     retained_draft_ids=set(draft_ids),
@@ -598,18 +642,15 @@ class AdminDocumentMixin:
         raise ValueError("管理台资料必须先完成字段提取，再确认写入 MySQL + Milvus")
 
     async def with_parse_result(self, task: dict[str, Any]) -> dict[str, Any]:
-        if task.get("parsed_result") or not task.get("document_id"):
-            return task
-        try:
-            result = await self.parse_result(str(task["document_id"]))
-        except Exception:  # noqa: BLE001 - 管理列表不因预览补充失败而中断
-            result = None
-        return {**task, "parsed_result": result} if result else task
+        return await DocumentLifecycleApplicationService(self.runtime).with_parse_result(
+            task, load_parse_result=self.parse_result,
+        )
 
     async def lifecycle_action(
         self, action: str, version_id: str, user_id: str, *,
         task: dict[str, Any] | None = None,
         reason_code: str | None = None, reason_text: str | None = None,
+        direct_delete: bool = False,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         store = self.runtime.require_lifecycle()
         if store.get_version(version_id) is None:
@@ -630,4 +671,5 @@ class AdminDocumentMixin:
             return None, task
         return await DocumentLifecycleApplicationService(self.runtime).run_action(
             action, version_id, user_id, task, reason_code, reason_text, user_role="admin",
+            **({"direct_delete": True} if direct_delete else {}),
         )

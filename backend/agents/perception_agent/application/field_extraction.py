@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import time
@@ -32,6 +33,7 @@ from core.prompts.field_extraction import (
     build_smart_qa_field_extraction_system,
 )
 
+logger = logging.getLogger(__name__)
 
 FIELD_ALIASES = {
     "provider_name": "pub_dept",
@@ -488,9 +490,39 @@ async def enrich_draft_with_llm(
 
             async def complete_segment(prompt: list[dict[str, str]]) -> dict[str, Any]:
                 async with semaphore:
-                    return _parse_draft_review(
-                        await asyncio.wait_for(reviewer.complete(prompt), timeout=timeout_seconds)
-                    )
+                    messages = prompt
+                    for attempt in range(1, 3):
+                        raw = ""
+                        try:
+                            raw = await asyncio.wait_for(reviewer.complete(messages), timeout=timeout_seconds)
+                            try:
+                                return _parse_draft_review(raw)
+                            except ValueError as exc:
+                                if str(exc) == "LLM_REFUSAL":
+                                    logger.warning("字段提取模型拒答 code=LLM_REFUSAL response_chars=%s", len(raw))
+                                    raise
+                                # Pydantic 异常带原始字段值，不能进入任务审计或终端日志。
+                                raise ValueError("DRAFT_INVALID_JSON") from None
+                        except ValueError as exc:
+                            if str(exc) not in {"DRAFT_INVALID_JSON", "LLM_OUTPUT_EMPTY", "LLM_OUTPUT_TRUNCATED"}:
+                                raise
+                            logger.warning(
+                                "字段提取输出校验失败 code=%s attempt=%s/2 response_chars=%s retry=%s",
+                                str(exc), attempt, len(str(raw or "")), attempt < 2,
+                            )
+                            if attempt == 2:
+                                raise
+                            messages = [*prompt, {
+                                "role": "user",
+                                "content": (
+                                    "上一次回复格式无效、为空或被截断。请重新根据上面的原始资料提取，"
+                                    "只输出一个完整 JSON 对象，不要 Markdown 或解释。"
+                                    '结构示例：{"title":"名称","fields":{},"summary":"摘要",'
+                                    '"missing_fields":[],"optional_questions":[],"confidence":0.5}。'
+                                    "fields 必须是对象，使用系统提示给出的字段名填写有原文依据的业务字段，"
+                                    "不要照抄空示例；压缩冗长文字，保证 JSON 完整闭合。"
+                                ),
+                            }]
 
             completed = await asyncio.gather(
                 *(complete_segment(prompt) for prompt in prompts),
@@ -668,7 +700,7 @@ def _build_draft_reviewer(role: str = "draft") -> Any | None:
 
         settings = settings_for_role(
             get_settings(), role if role in {"draft", "vision"} else "draft"
-        )
+        ).model_copy(update={"llm_response_format": "json_object"})
         if not all(
             (settings.llm_provider, settings.llm_model, settings.llm_base_url, settings.llm_api_key)
         ):
@@ -680,6 +712,12 @@ def _build_draft_reviewer(role: str = "draft") -> Any | None:
 
 def _parse_draft_review(raw: Any) -> dict[str, Any]:
     text = str(raw or "").strip()
+    # 上游的明确短句拒答不是 JSON 格式错误，也不应重复发送同一材料。
+    if text.rstrip("。.!！") in {
+        "抱歉，我无法回答这个问题", "抱歉，我无法满足这个请求",
+        "Sorry, I cannot answer this question",
+    }:
+        raise ValueError("LLM_REFUSAL")
     if text.startswith("```"):
         text = text.strip("`")
         if text.startswith("json"):

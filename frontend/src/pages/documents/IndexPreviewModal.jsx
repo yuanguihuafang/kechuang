@@ -1,4 +1,5 @@
 import { MineruInlinePreview } from './MineruInlinePreview.jsx';
+import { currentDocumentTask } from './documentStatus.js';
 
 function blockLocationLabel(block) {
   const metadata = block.metadata || {};
@@ -18,6 +19,7 @@ function blockLocationLabel(block) {
 
 export function IndexPreviewModal({ document, parsed, loading, busy, onClose, onConfirm }) {
   if (!document) return null;
+  const taskUnavailable = !currentDocumentTask(document, [document.supervisor_task]);
   const blocks = parsed?.blocks || [];
   const images = parsed?.metadata?.images || [];
   return <div className="index-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
@@ -28,7 +30,7 @@ export function IndexPreviewModal({ document, parsed, loading, busy, onClose, on
         {parsed.raw_text && <details className="mineru-original" open><summary>解析原文</summary><MineruInlinePreview text={parsed.raw_text} blocks={blocks} pageTexts={parsed.page_texts} images={images} /></details>}
         <div className="index-preview-blocks">{blocks.map((block, index) => <article className="parse-block" key={block.block_id || index}><header><span>{block.block_type || 'text'}</span><span>{blockLocationLabel(block)}</span><span>#{index + 1}</span></header><div className="parse-block-text">{block.text || '（空块）'}</div></article>)}</div>
       </div>}
-      <footer className="index-preview-footer"><span>确认后将先替换当前文档旧索引，再写入新的有效解析块。</span><button type="button" onClick={onConfirm} disabled={loading || !parsed || busy}>{busy ? '索引提交中…' : '确认并更新索引'}</button></footer>
+      <footer className="index-preview-footer"><span>{taskUnavailable ? '当前版本缺少可用的文件处理任务，请通过文档目录的“更新”重新上传。' : '确认后将先替换当前文档旧索引，再写入新的有效解析块。'}</span><button type="button" onClick={onConfirm} disabled={loading || !parsed || busy || taskUnavailable}>{busy ? '索引提交中…' : '确认并更新索引'}</button></footer>
     </section>
   </div>;
 }

@@ -63,13 +63,20 @@ class DraftStore:
 class Lifecycle:
     def __init__(self):
         self.updates = []
+        self.knowledge_type = "solution"
+
+    def bind_draft_attachments(self, attachments, *, user_id, knowledge_type):
+        assert attachments[0]["version_id"] == "doc-1:v1"
+        assert user_id == "user-1"
+        self.knowledge_type = knowledge_type
+        return ["doc-1"]
 
     def get_document(self, document_id):
         return {
             "document_id": document_id,
             "user_id": "user-1",
             "scope_id": "public",
-            "knowledge_type": "solution",
+            "knowledge_type": self.knowledge_type,
             "active_version": {"version_id": f"{document_id}:v1"},
         }
 
@@ -150,15 +157,28 @@ def test_publish_image_preflight_checks_metadata_ids_and_document_ownership():
     assert storage.checked == ["derived/doc-1/image.jpg"]
 
 
-def test_publishing_attached_draft_updates_document_version_lifecycle(monkeypatch):
+@pytest.mark.parametrize("source_text", [
+    "解析原文",
+    "![证据图片](/api/v1/perception/images/doc-1/image-1)",
+    "[证据图片](/api/v1/perception/images/doc-1/image-1)",
+    "/api/v1/perception/images/doc-1/image-1",
+])
+@pytest.mark.parametrize("initial_type", ["solution", ""])
+def test_publishing_attached_draft_updates_document_version_lifecycle(monkeypatch, source_text, initial_type):
     monkeypatch.setattr(
         "services.application.draft_publishing.PostgresAuditSink",
         lambda: SimpleNamespace(record=lambda *_args, **_kwargs: None),
     )
     draft_store = DraftStore()
+    draft_store.record["draft"]["source_blocks"] = [{"text": source_text}]
     lifecycle = Lifecycle()
+    lifecycle.knowledge_type = initial_type
     session_upserts = []
     retrieval = Retrieval()
+
+    class ImageStorage(Storage):
+        async def load_image_manifest(self, _document_id):
+            return [{"image_id": "image-1", "minio_object_key": "derived/doc-1/image.jpg"}]
 
     class SessionStore:
         def get(self, _thread_id):
@@ -173,7 +193,7 @@ def test_publishing_attached_draft_updates_document_version_lifecycle(monkeypatc
             save=lambda _payload: {"business_record_id": "mysql-1"}
         ),
         require_lifecycle=lambda: lifecycle,
-        storage_service=Storage(),
+        storage_service=ImageStorage(),
         embedded_retrieval=SimpleNamespace(agent=retrieval),
         require_conversation=lambda: SimpleNamespace(session_store=SessionStore()),
     )
@@ -185,6 +205,7 @@ def test_publishing_attached_draft_updates_document_version_lifecycle(monkeypatc
     )
 
     assert len(lifecycle.updates) == 1
+    assert lifecycle.knowledge_type == "solution"
     version_id, fields = lifecycle.updates[0]
     assert version_id == "doc-1:v1"
     assert fields == {
@@ -249,6 +270,48 @@ def test_missing_attachment_object_blocks_before_mysql_or_index_write(monkeypatc
         ).publish("draft-1", DraftPublishRequest(user_id="user-1")))
 
     assert mysql_calls == []
+    assert retrieval.preflight_request is None
+    assert draft_store.record["status"] == "CONFIRMED"
+
+
+@pytest.mark.parametrize("mismatch", ["storage_key", "source_version", "source_document"])
+def test_stale_attachment_identity_is_rejected_before_publish_writes(monkeypatch, mismatch):
+    monkeypatch.setattr(
+        "services.application.draft_publishing.PostgresAuditSink",
+        lambda: SimpleNamespace(record=lambda *_args, **_kwargs: None),
+    )
+    draft_store = DraftStore()
+    content = draft_store.record["draft"]
+    content["attachments"][0]["storage_key"] = "uploads/doc-1.pdf"
+    if mismatch == "storage_key":
+        content["attachments"][0]["storage_key"] = "uploads/old-file.pdf"
+    else:
+        content["source_blocks"] = [{
+            "text": "正文", "document_id": "other-doc" if mismatch == "source_document" else "doc-1",
+            "version_id": "doc-1:v0" if mismatch == "source_version" else "doc-1:v1",
+        }]
+    retrieval = Retrieval()
+    writes = []
+    runtime = SimpleNamespace(
+        require_draft_store=lambda: draft_store,
+        require_lifecycle=lambda: Lifecycle(),
+        require_business_record_sink=lambda: SimpleNamespace(
+            save=lambda *_a, **_kw: writes.append("mysql"),
+            update=lambda *_a, **_kw: writes.append("mysql"),
+        ),
+        storage_service=Storage(),
+        embedded_retrieval=SimpleNamespace(agent=retrieval),
+        require_conversation=lambda: SimpleNamespace(
+            session_store=SimpleNamespace(get=lambda _: None, upsert=lambda *_a, **_kw: None)
+        ),
+    )
+    with pytest.raises(HTTPException, match="附件|原文") as error:
+        asyncio.run(DraftPublishingApplicationService(
+            runtime, lambda user_id: (user_id, "admin", None),
+        ).publish("draft-1", DraftPublishRequest(user_id="user-1")))
+    assert error.value.status_code == 409
+    assert writes == []
+    assert retrieval.request is None
     assert retrieval.preflight_request is None
     assert draft_store.record["status"] == "CONFIRMED"
 

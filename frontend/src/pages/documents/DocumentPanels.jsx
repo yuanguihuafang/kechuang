@@ -1,14 +1,19 @@
 import { api } from '../../api.js';
-import { publicationStatusLabel } from './documentStatus.js';
+import { currentDocumentVersion, publicationStatusLabel } from './documentStatus.js';
 import { AuthenticatedDownload } from './AuthenticatedDownload.jsx';
 
 const versionStatusLabel = (value) => ({
   PUBLISHED: '已发布', UNPUBLISHED: '已下架', EXPIRED: '已过期', RESTORED: '已恢复', RECYCLED: '回收站',
-  INDEXED: '已索引', FAILED: '失败', RUNNING: '处理中',
+  INDEXED: '已索引', DELETED: '已删除', NOT_INDEXED: '未索引', FAILED: '失败', RUNNING: '处理中',
 }[value] || value || '未记录');
 
 export function VersionPanel({ document, versions, loading, busy, identity, associatedDrafts = [], taskRecords = [], onUpdate, onUnpublish, onRepublish, onRecycle, onRestore, onPurge }) {
   if (!document) return null;
+  const version = currentDocumentVersion(document, versions);
+  const purged = version?.status === 'PURGED';
+  const recycled = version?.status === 'RECYCLED';
+  const published = !purged && !recycled && version?.publication_status === 'PUBLISHED';
+  const unpublished = !purged && !recycled && version?.status === 'UNPUBLISHED';
   return <section className="document-detail version-panel">
     <div className="section-head document-detail-head">
       <div><p className="overline">DOCUMENT / DETAIL</p><h2>文档详情</h2></div>
@@ -17,12 +22,8 @@ export function VersionPanel({ document, versions, loading, busy, identity, asso
         <span>文档 ID：{document.document_id || '—'}</span>
       </div>
     </div>
-    {loading ? <div className="table-empty">正在读取版本记录…</div> : !versions.length ? <div className="table-empty">暂无可管理的文档版本。</div> : <div className="version-list">
-      {versions.map((version) => {
-        const published = version.publication_status === 'PUBLISHED' || version.status === 'PUBLISHED';
-        const unpublished = version.publication_status === 'UNPUBLISHED' || version.status === 'UNPUBLISHED';
-        const recycled = version.publication_status === 'RECYCLED' || version.status === 'RECYCLED';
-        return <article className="version-card" key={version.version_id}>
+    {loading ? <div className="table-empty">正在读取文档记录…</div> : !version ? <div className="table-empty">暂无可管理的当前文档。</div> : <div className="version-list">
+        <article className="version-card" key={version.version_id}>
           <div className="version-card-main">
             <small>索引：{versionStatusLabel(version.index_status)} · 可检索：{publicationStatusLabel(version)}</small>
             <small>分块：{version.indexed_count ?? version.chunk_count ?? '—'} · 更新时间：{version.updated_at ? new Date(version.updated_at).toLocaleString('zh-CN', { hour12: false }) : '—'}</small>
@@ -30,15 +31,14 @@ export function VersionPanel({ document, versions, loading, busy, identity, asso
             {version.error && <em>{version.error}</em>}
           </div>
           <div className="version-actions">
-            {!recycled && <button className="text-button" type="button" onClick={() => onUpdate?.(document)} disabled={busy}>更新</button>}
-            <AuthenticatedDownload url={api.documentFileUrl(document.document_id, identity)} filename={document.file_name} label="下载原文件" />
+            {!recycled && !purged && <button className="text-button" type="button" onClick={() => onUpdate?.(document)} disabled={busy}>更新</button>}
+            {!recycled && !purged && <AuthenticatedDownload url={api.adminDocumentFileUrl(document.document_id)} filename={document.file_name} label="下载原文件" />}
             {published && <button className="text-button danger-text" type="button" onClick={() => onUnpublish(version)} disabled={busy}>下架</button>}
             {unpublished && !recycled && <button className="text-button" type="button" onClick={() => onRepublish(version)} disabled={busy}>重新上架</button>}
             {unpublished && !recycled && <button className="text-button danger-text" type="button" onClick={() => onRecycle(version)} disabled={busy}>移入回收站</button>}
             {recycled && <><button className="text-button" type="button" onClick={() => onRestore(version)} disabled={busy}>恢复版本</button><button className="text-button danger-text" type="button" onClick={() => onPurge(version)} disabled={busy}>彻底清理</button></>}
           </div>
-        </article>;
-      })}
+        </article>
     </div>}
     {!loading && <>
       <h3>关联草稿（{associatedDrafts.length}）</h3>

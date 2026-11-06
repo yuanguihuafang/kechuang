@@ -37,6 +37,7 @@ from core.contracts.knowledge import (
     DocumentUnpublishRequest,
     IndexTextRequest,
     SessionSummaryRequest,
+    resolve_knowledge_type,
 )
 from core.contracts.mysql_schema import append_attachment_names
 from core.contracts.retrieval import ChunkPreviewRequest
@@ -47,6 +48,8 @@ from services.storage.minio.image_service import (
     perception_image_url,
 )
 from services.storage.minio.parent_service import ParentRecordService
+from services.persistence.document_lifecycle import DocumentLifecycleStore
+from services.persistence.retention import serialize_storage_references
 from services.vector.milvus.milvus_service import (
     MILVUS_CHUNK_TEXT_MAX_BYTES,
     MilvusService,
@@ -110,6 +113,7 @@ class RetrievalAgent:
         embedding_service: EmbeddingService | None = None,
         image_manifest_service: ImageManifestService | None = None,
         parent_record_service: ParentRecordService | None = None,
+        lifecycle_store: Any | None = None,
     ) -> None:
         self.search_service = search_service or SearchService()
         self.public_milvus = self.search_service.public_milvus
@@ -118,6 +122,7 @@ class RetrievalAgent:
         self.embedding = embedding_service or self.search_service.embedding_service
         self.image_manifest = image_manifest_service or ImageManifestService()
         self.parent_records = parent_record_service or ParentRecordService()
+        self.lifecycle_store = lifecycle_store
         retrieve_graph = StateGraph(_RetrievalState)
         retrieve_graph.add_node("retrieve", self._retrieve)
         retrieve_graph.add_node("format_evidence", self._format_evidence)
@@ -435,6 +440,50 @@ class RetrievalAgent:
 
         return await self.publish_document(document_id, request)
 
+    def _current_version(self, document_id: str, request: DocumentUnpublishRequest) -> str | None:
+        if not request.version_id:
+            return None
+        store = getattr(self, "lifecycle_store", None)
+        if store is None:
+            store = DocumentLifecycleStore()
+            self.lifecycle_store = store
+        document = store.get_document(document_id, include_purged=True)
+        version = store.get_version(request.version_id)
+        if (not document or not version or version.get("document_id") != document_id
+                or document.get("active_version_id") != request.version_id
+                or version.get("status") == "PURGED"):
+            raise ValueError("只能操作当前活动版本，请刷新文档目录")
+        if (version.get("scope_id") != request.scope_id
+                or resolve_knowledge_type(version.get("knowledge_type"), document.get("knowledge_type"))
+                != request.knowledge_type):
+            raise ValueError("活动版本的知识范围或类型不匹配")
+        if request.scope_id == "internal" and version.get("user_id") != request.identity.user_id:
+            raise ValueError("无权操作其他用户的活动版本")
+        return request.version_id
+
+    def _set_document_publication_status(
+        self, document_id: str, request: DocumentUnpublishRequest, status: str,
+        active_version_id: str | None,
+    ) -> int:
+        target = self._milvus_for_scope(request.scope_id, request.knowledge_type)
+        owner = {"user_id": request.identity.user_id} if request.scope_id == "internal" else {}
+        count = 0
+        if request.mysql_id:
+            count += target.set_publication_status_by_mysql_id(request.mysql_id, status, **owner)
+        if request.version_id:
+            count += target.set_publication_status_by_version_id(
+                request.version_id, status, active_version_id=active_version_id, **owner
+            )
+        elif not request.mysql_id or status == "UNPUBLISHED":
+            count += target.set_publication_status_by_document_id(
+                document_id, status,
+                **({"chunk_role": "agent_doc"} if request.mysql_id else {}), **owner,
+            )
+        if count <= 0:
+            raise ValueError("没有匹配的有效索引，请通过正常确认发布流程重建索引")
+        return count
+
+    @serialize_storage_references
     async def unpublish_document(
         self, document_id: str, request: DocumentUnpublishRequest
     ) -> IndexResult:
@@ -447,52 +496,26 @@ class RetrievalAgent:
                 error="测试身份无权下架该知识范围",
             )
         try:
+            active_version_id = self._current_version(document_id, request)
             target = self._milvus_for_scope(request.scope_id, request.knowledge_type)
-            if request.remove_vectors and request.scope_id == "internal":
-                (
+            count = 0
+            if request.remove_vectors:
+                owner = {"user_id": request.identity.user_id} if request.scope_id == "internal" else {}
+                if request.version_id:
                     target.delete_by_version_id(
-                        request.version_id, user_id=request.identity.user_id
-                    )
-                    if request.version_id
-                    else target.delete_by_document_id(document_id, user_id=request.identity.user_id)
-                )
-            elif request.remove_vectors:
-                (
-                    target.delete_by_version_id(request.version_id)
-                    if request.version_id
-                    else target.delete_by_document_id(document_id)
-                )
-            elif request.scope_id == "internal":
-                if request.mysql_id:
-                    target.set_publication_status_by_mysql_id(
-                        request.mysql_id, "UNPUBLISHED", user_id=request.identity.user_id
-                    )
-                if request.version_id:
-                    target.set_publication_status_by_version_id(
-                        request.version_id, "UNPUBLISHED", user_id=request.identity.user_id
+                        request.version_id, active_version_id=active_version_id, **owner
                     )
                 else:
-                    target.set_publication_status_by_document_id(
-                        document_id,
-                        "UNPUBLISHED",
-                        user_id=request.identity.user_id,
-                        chunk_role="agent_doc" if request.mysql_id else None,
-                    )
+                    target.delete_by_document_id(document_id, **owner)
             else:
-                if request.mysql_id:
-                    target.set_publication_status_by_mysql_id(request.mysql_id, "UNPUBLISHED")
-                if request.version_id:
-                    target.set_publication_status_by_version_id(request.version_id, "UNPUBLISHED")
-                else:
-                    target.set_publication_status_by_document_id(
-                        document_id,
-                        "UNPUBLISHED",
-                        chunk_role="agent_doc" if request.mysql_id else None,
-                    )
-            return IndexResult(status="UNPUBLISHED", document_id=document_id)
+                count = self._set_document_publication_status(
+                    document_id, request, "UNPUBLISHED", active_version_id
+                )
+            return IndexResult(status="UNPUBLISHED", document_id=document_id, indexed_count=count)
         except Exception as exc:
             return IndexResult(status="FAILED", document_id=document_id, error=str(exc))
 
+    @serialize_storage_references
     async def republish_document(
         self, document_id: str, request: DocumentUnpublishRequest
     ) -> IndexResult:
@@ -503,30 +526,11 @@ class RetrievalAgent:
                 status="FAILED", document_id=document_id, error="测试身份无权上架该知识范围"
             )
         try:
-            target = self._milvus_for_scope(request.scope_id, request.knowledge_type)
-            if request.mysql_id:
-                updated_count = target.set_publication_status_by_mysql_id(
-                    request.mysql_id,
-                    "PUBLISHED",
-                    user_id=request.identity.user_id if request.scope_id == "internal" else None,
-                )
-                return IndexResult(
-                    status="PUBLISHED", document_id=document_id, indexed_count=updated_count
-                )
-            if request.version_id:
-                if request.scope_id == "internal":
-                    target.set_publication_status_by_version_id(
-                        request.version_id, "PUBLISHED", user_id=request.identity.user_id
-                    )
-                else:
-                    target.set_publication_status_by_version_id(request.version_id, "PUBLISHED")
-            elif request.scope_id == "internal":
-                target.set_publication_status_by_document_id(
-                    document_id, "PUBLISHED", user_id=request.identity.user_id
-                )
-            else:
-                target.set_publication_status_by_document_id(document_id, "PUBLISHED")
-            return IndexResult(status="PUBLISHED", document_id=document_id)
+            active_version_id = self._current_version(document_id, request)
+            count = self._set_document_publication_status(
+                document_id, request, "PUBLISHED", active_version_id
+            )
+            return IndexResult(status="PUBLISHED", document_id=document_id, indexed_count=count)
         except Exception as exc:
             return IndexResult(status="FAILED", document_id=document_id, error=str(exc))
 

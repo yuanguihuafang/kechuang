@@ -131,9 +131,6 @@ class PaddleOCRDocumentParser:
             except (KeyError, TypeError, ValueError) as exc:
                 raise RuntimeError("PaddleOCR 查询任务响应格式错误") from exc
             if state == "done":
-                total_pages = (data.get("extractProgress") or {}).get("totalPages")
-                if str(total_pages or "").isdigit() and int(total_pages) > 50:
-                    raise RuntimeError("文件超过限制：单个文件不能超过50页")
                 result_url = str((data.get("resultUrl") or {}).get("jsonUrl") or "").strip()
                 if not result_url:
                     raise RuntimeError("PaddleOCR 任务完成但未返回 jsonUrl")

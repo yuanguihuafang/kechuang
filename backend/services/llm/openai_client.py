@@ -83,7 +83,13 @@ class OpenAIClient(LLMClient):
                 }
         response_format = _response_format_for(self.settings.llm_response_format)
         if response_format is not None:
-            payload["response_format"] = response_format
+            if is_responses_api:
+                payload["text"] = {"format": response_format}
+                payload["max_output_tokens"] = 16384
+            else:
+                payload["response_format"] = response_format
+                payload["max_tokens"] = 16384
+        format_key = "text" if is_responses_api else "response_format"
 
         started_at = perf_counter()
         llm_role = self.settings.llm_role or "default"
@@ -102,7 +108,7 @@ class OpenAIClient(LLMClient):
                     "timeoutSeconds": self.settings.llm_timeout_seconds,
                     "connectTimeoutSeconds": self.settings.llm_connect_timeout_seconds,
                     "maxAttempts": max(1, self.settings.llm_max_retries + 1),
-                    "responseFormatEnabled": "response_format" in payload,
+                    "responseFormatEnabled": format_key in payload,
                 }
             },
         )
@@ -145,13 +151,13 @@ class OpenAIClient(LLMClient):
                         except Exception:  # noqa: BLE001,S110 - 错误正文读取失败可忽略
                             pass
                     if (
-                        "response_format" in payload
+                        format_key in payload
                         and not response_format_downgraded
                         and _response_format_is_unsupported(retryable_status, error_detail)
                     ):
                         # 供应商或模型不支持 JSON Mode 时，立刻用同一模型降级为
                         # 普通 JSON 提示调用；这不是网络重试，不消耗重试次数。
-                        payload.pop("response_format")
+                        payload.pop(format_key)
                         response_format_downgraded = True
                         logger.warning(
                             "模型不支持 response_format，已降级为普通 JSON 调用",
@@ -195,25 +201,8 @@ class OpenAIClient(LLMClient):
                     attempt += 1
 
         latency_ms = int((perf_counter() - started_at) * 1000)
-        _record_llm_metric(
-            status="SUCCESS",
-            duration_ms=latency_ms,
-        )
-        logger.info(
-            f"LLM 请求完成 [{llm_role}]",
-            extra={
-                "structured": {
-                    "event": "llm_request_finished",
-                    "provider": self.settings.llm_provider,
-                    "role": llm_role,
-                    "model": model,
-                    "promptVersion": prompt_version(messages),
-                    "latencyMs": latency_ms,
-                }
-            },
-        )
-
         if is_responses_api:
+            finish_reason = (resp_data.get("incomplete_details") or {}).get("reason") or resp_data.get("status")
             content = resp_data.get("output_text")
             if not isinstance(content, str):
                 values = []
@@ -226,9 +215,34 @@ class OpenAIClient(LLMClient):
             choices = resp_data.get("choices")
             if not choices:
                 raise RuntimeError("LLM 返回中缺少 choices。")
+            finish_reason = choices[0].get("finish_reason")
             content = choices[0].get("message", {}).get("content")
+        output_error = None
+        if finish_reason in {"length", "max_output_tokens", "incomplete"} or (
+            is_responses_api and resp_data.get("status") == "incomplete"
+        ):
+            output_error = "LLM_OUTPUT_TRUNCATED"
+        elif not isinstance(content, str) or not content.strip():
+            output_error = "LLM_OUTPUT_EMPTY"
+        if response_format is not None and output_error:
+            _record_llm_metric(status="FAILED", duration_ms=latency_ms, error_code=output_error)
+            logger.warning(
+                "LLM 输出不可用 [%s] code=%s model=%s finish_reason=%s response_chars=%s",
+                llm_role, output_error, model, finish_reason,
+                len(content) if isinstance(content, str) else 0,
+            )
+            raise ValueError(output_error)
         if not isinstance(content, str) or not content.strip():
             raise RuntimeError("LLM 返回内容为空。")
+        _record_llm_metric(status="SUCCESS", duration_ms=latency_ms)
+        logger.info(
+            f"LLM 请求完成 [{llm_role}]",
+            extra={"structured": {
+                "event": "llm_request_finished", "provider": self.settings.llm_provider,
+                "role": llm_role, "model": model, "promptVersion": prompt_version(messages),
+                "latencyMs": latency_ms, "finishReason": finish_reason, "outputChars": len(content),
+            }},
+        )
         record_llm_exchange(
             provider=self.settings.llm_provider,
             role=llm_role,

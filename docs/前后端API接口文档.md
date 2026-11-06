@@ -70,11 +70,39 @@ X-Trace-ID: {{$randomUUID}}
 | 403 | `FORBIDDEN` | 无权限，停止当前操作 |
 | 404 | `NOT_FOUND` | 资源不存在或不属于当前用户 |
 | 409 | `CONFLICT` | 状态冲突，刷新资源后再操作 |
+| 415 | `UNSUPPORTED_FILE_TYPE` | 文件格式不支持，按提示转换后重新上传，不自动重试 |
 | 422 | `VALIDATION_ERROR` | 按 `details` 定位字段并提示 |
 | 429 | `RATE_LIMITED` | 按 `Retry-After` 秒数重试 |
 | 502 | `UPSTREAM_ERROR` | 上游服务失败，可重试 |
 | 503 | `DEPENDENCY_UNAVAILABLE` | 后端依赖未就绪，展示系统繁忙 |
 | 500 | `INTERNAL_ERROR` | 不展示堆栈，只展示 trace_id |
+
+### 1.4 不支持的文件格式
+
+所有文件上传和解析入口统一使用错误码`UNSUPPORTED_FILE_TYPE`。现有成功响应及任务接口HTTP状态不变；新增的`error_code`为可选字段，不能仅用HTTP是否为2xx判断任务成功。
+
+- 管理台`POST /api/v1/admin/files/upload`仍返回HTTP202；上传被拒绝时返回`status=FAILED`、`stage=failed`、`error_code=UNSUPPORTED_FILE_TYPE`，`error`为可直接显示的转换提示。随后查询任务仍保留相同错误码。
+- Perception上传和同步解析接口仍返回HTTP200；业务失败体为`status=FAILED`、`error_code=UNSUPPORTED_FILE_TYPE`、`error`。异步解析先返回HTTP202，轮询任务获得上述失败原因。
+- 问答`POST /api/v1/chat/materials/parse`对不支持的文档返回HTTP415，统一错误体见下方示例。
+- 问答流式接口已进入SSE后，HTTP仍为200；发送`error`事件：`{"code":415,"error_code":"UNSUPPORTED_FILE_TYPE","stage":"upload","message":"..."}`，之后结束，不再发送成功`done`。`code`保留原有数字HTTP语义，前端按`error_code`识别格式问题。
+- `.doc`应使用Word/WPS另存为`.docx`；`.ppt`应使用PowerPoint/WPS另存为`.pptx`；`.xls`应使用Excel/WPS另存为`.xlsx`。不能仅修改后缀。其他格式按返回提示选择支持的文件；文档可导出为PDF，压缩包应先解压后选择文件。
+- 支持的文档格式仍为`.pdf/.docx/.pptx/.xlsx/.md/.txt/.jpg/.jpeg/.png/.webp/.bmp/.tif/.tiff`，本次不增加格式或改变50MB限制。问答音频继续走原有语音流程。
+
+管理台失败响应示例（仅列关键字段）：
+
+```json
+{"task_id":"task_example","status":"FAILED","stage":"failed","error_code":"UNSUPPORTED_FILE_TYPE","error":"暂不支持 .doc 文件，请使用 Word/WPS 另存为 .docx 后上传，不能只修改文件后缀。"}
+```
+
+问答HTTP415示例：
+
+```json
+{"error":{"code":"UNSUPPORTED_FILE_TYPE","message":"暂不支持 .doc 文件，请使用 Word/WPS 另存为 .docx 后上传，不能只修改文件后缀。","details":{"code":"UNSUPPORTED_FILE_TYPE","message":"暂不支持 .doc 文件，请使用 Word/WPS 另存为 .docx 后上传，不能只修改文件后缀。"}},"trace_id":"trace_example"}
+```
+
+前端处理顺序：HTTP失败读取`error.code/error.message`；HTTP成功仍检查业务`status`，`FAILED`时读取`error_code/error`。命中该错误后停止当前上传或解析状态、展示完整提示，等待用户选择转换后的新文件；不继续提取字段或发布。
+
+用户先上传、后确定需求/方案/成果用途时，创建或保存草稿会同步补齐附件文档的空知识类型；发布前也会检查并补齐此类历史记录。补齐仅限同用户、公共范围、当前有效版本且未发布/未建索引的文档，不覆盖已有分类或已发布来源。附件归属、版本、路径或已有分类冲突时仍返回HTTP409，前端展示后端提示；不要求用户重新解析有效附件。
 
 ---
 
@@ -531,9 +559,12 @@ Authorization: Bearer <access_token>
 ```
 
 - `inline=true`：允许预览 PDF；外部用户可预览。
-- `inline=false` 或省略：下载原文件；当前代码仅内部用户允许下载。
-- 必须携带登录后的 `Authorization: Bearer <access_token>`；`user_id` 查询参数不能代替登录认证。
+- `inline=false` 或省略：下载原文件。公开已发布文件允许匿名下载；外部用户可下载自己提交的文件或公开已发布文件。
+- 访问非公开或未发布文件时携带登录后的 `Authorization: Bearer <access_token>`；`user_id` 查询参数不能代替登录认证。
 - 返回二进制文件，不是 JSON；前端使用返回的 `Content-Type` 和 `Content-Disposition`。
+- 管理控制台使用 `GET /api/v1/admin/documents/{document_id}/file?inline=true`，沿用现有管理接口部署访问边界，无需普通用户登录。仅提供当前未回收、未彻底删除版本的原件；原件不存在返回404，存储服务未就绪返回503。管理台文档详情和草稿附件下载均使用此入口，普通用户界面继续使用上面的接口。
+- 字段提取使用DeepSeek兼容JSON Mode：`response_format={"type":"json_object"}`，输出预算16384 tokens。格式或结构不符时保留原始材料纠正重试一次；空回复和明确截断也只重试一次。最终失败通过任务的`draft_error_code/draft_error`返回`DRAFT_INVALID_JSON`、`LLM_OUTPUT_EMPTY`或`LLM_OUTPUT_TRUNCATED`，前端直接展示并允许重新提取，无需重传原件。JSON Mode不替代业务字段校验，所有校验通过后才生成草稿。
+- 明确的模型短句拒答返回`LLM_REFUSAL`，不自动重试、不生成草稿。前端显示`draft_error`中联系供应商或更换字段提取模型的提示；原件和解析原文继续保留。
 
 ### 7.4 我的草稿
 
@@ -784,7 +815,7 @@ Authorization: Bearer <access_token>
 
 这是逻辑删除，返回 `{draft, status:"DELETED"}`；个人中心应立即隐藏草稿及附件入口，原文和附件不会在该请求中立即物理删除。已发布草稿须先下架。管理员控制台的彻底删除是单独的管理操作。
 
-**清理策略待协调**：产品此前决定暂不启用两类 30 天清理；但当前本地后端仍有每日北京时间 02:00 清理逻辑：逻辑删除草稿满 30 天后尝试彻底清理；`CONFIRMED/PENDING_REVIEW` 草稿连续 30 天未更新时清附件并保留草稿字段。清理会检查共享引用及已发布版本保护。该代码与“暂不启用”的决定不一致，关闭清理需另行修改后端；在此之前客户端遇到附件 `retention_status=EXPIRED` 或空 `storage_key` 时应隐藏下载入口。
+当前后端在服务运行时按北京时间每天 02:00 检查清理：逻辑删除超过 30 天的草稿及关联资源可进入清理；`CONFIRMED/PENDING_REVIEW` 草稿超过 30 天未更新时，其附件可进入清理，草稿字段保留。清理会检查共享引用和已发布版本保护；自2026-11-05起，未保存临时上传附件有效期为7天，以服务端返回的`expires_at`为准。实际结果取决于服务运行、引用状态和清理执行情况。客户端遇到附件 `retention_status=EXPIRED` 或空 `storage_key` 时应隐藏下载入口。
 
 ---
 
@@ -1015,6 +1046,12 @@ pm.test("登录成功", () => pm.expect(body.authenticated).to.eql(true));
 - `GET /api/v1/admin/documents?page=1&page_size=20&knowledge_type=demand`：数据库分页，默认每页 20 条、最大 100 条。响应包含 `documents`、`total`、`page`、`page_size`、`total_pages` 和 `source`；列表只含文档摘要及当前版本摘要，不返回版本历史、关联草稿或任务记录。
 - 文档目录可选 `search` 参数按文件名或文档 ID 做不区分大小写的子串模糊搜索；`published_or_admin_only=true` 时仅返回管理员上传的全部文档及用户已发布文档。筛选在服务端分页前执行；省略或为 `false` 时保持完整目录范围。
 - `GET /api/v1/admin/documents/{document_id}`：用户打开单条文档详情时调用，返回该文档的 `versions`、`associated_drafts` 和 `task_records`。
+- 管理页面仅展示活动版本一条操作记录。详情与已保存解析原文独立读取，原文可读不以任务是否成功为前提；版本查询失败须显示错误，不能沿用旧版本继续操作。
+- 替换上传返回新的递增版本；前端同步更新 `version_id`、`active_version_id` 和对象键。解析、提取、发布只使用文档ID、活动版本、对象键均匹配的文件处理任务；返回 `STALE_SOURCE` 时刷新详情，不重试旧任务。没有有效任务时只读展示原文，提示通过“更新”重新上传处理。
+- 文件处理任务以 `operation=file_ingestion` 判别；`task_type` 存在时须为 `document_ingestion`，历史任务缺少该冗余字段不等于任务无效。解析结果缺少 `version_id` 时仍须比较 `storage_key`，避免新版本未解析时显示旧正文。
+- 新解析保留旧发布原文的快照及图片映射，不删除已发布封面所引用的旧图片。封面和正文统一使用 `/api/v1/perception/images/{document_id}/{image_id}`；图片ID由服务端返回，前端不得自行推算或替换。
+- 上下架只适用于有效且非空的已发布索引；上架或回收站恢复还会检查原件存在。未发布版本的恢复只回到待处理状态，不会变为公开可检索。非活动版本及 `PURGED` 版本不允许操作。
+- `DELETE /api/v1/admin/documents/{document_id}` 通过统一生命周期清理关联草稿、业务记录、向量和附件，保留其他文档的共享引用；失败进入补偿状态，不能只删除附件后报告成功。前端以成功响应为准更新列表，迟到响应不得覆盖后来选中的文档。
 - `GET /api/v1/admin/tasks?page=1&page_size=100&document_id={document_id}&operation={operation}`：独立分页查询管理任务；`document_id` 和 `operation` 均为可选筛选条件，默认每页 100 条、最大 500 条。
 - `POST /api/v1/admin/tasks/{task_id}/parse`：上传后或解析完成待确认时启动/重新启动解析；任务运行中重复请求返回当前状态。重新解析会清空该任务的旧解析预览和草稿关联，不删除已保存的草稿记录。
 - `POST /api/v1/admin/tasks/{task_id}/extract-fields?knowledge_type=solution`：对已解析任务按指定知识类型提取草稿；允许 `enterprise`、`demand`、`achievement`、`expert`、`solution`。省略时使用任务已有类型；任务仍无类型时返回 `draft_status=EMPTY`，不调用 LLM、不生成草稿且不报错。`draft_status=RUNNING` 时重复请求返回当前状态，已完成后再次请求会重新生成，并清空任务当前草稿关联，不删除旧草稿记录。

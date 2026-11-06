@@ -48,6 +48,17 @@ def test_daily_cleanup_is_scheduled_for_beijing_0200():
     ) == 23 * 60 * 60 + 59 * 60
 
 
+def test_temporary_upload_is_retained_for_seven_days():
+    from services.application.temporary_materials import is_expired_attachment, temporary_expires_at
+
+    uploaded = datetime.now(timezone.utc)
+    attachment = {"temporary": True, "expires_at": temporary_expires_at()}
+    expires = datetime.fromisoformat(attachment["expires_at"])
+    assert timedelta(days=7) <= expires - uploaded < timedelta(days=7, seconds=1)
+    assert not is_expired_attachment(attachment, now=uploaded + timedelta(days=6))
+    assert is_expired_attachment(attachment, now=expires)
+
+
 def test_references_include_direct_artifact_keys_and_nested_lists():
     refs = retention.collect_storage_references(
         documents=[{"artifact_refs": {"parse_result": "derived/other/result.json",
@@ -484,6 +495,73 @@ def test_cleanup_protects_indexed_and_historical_published_versions():
                     {"status": "PURGED", "publication_status": "UNPUBLISHED"}]
 
     assert _published_document_ids(Lifecycle()) == {"doc"}
+
+
+@pytest.mark.parametrize("reference", ["CONFIRMED", "PUBLISHED", "source", "storage", "version", "none"])
+def test_temporary_task_cleanup_preserves_saved_shared_document(monkeypatch, reference):
+    from services.application import temporary_materials as cleanup
+
+    attachment = {"document_id": "shared-doc", "storage_key": "uploads/v1.pdf",
+                  "temporary": True, "expires_at": "2000-01-01T00:00:00Z"}
+    draft = {"draft_id": "saved", "source_document_id": "shared-doc",
+             "status": reference if reference in {"CONFIRMED", "PUBLISHED"} else "CONFIRMED",
+             "updated_at": datetime.now(timezone.utc).isoformat(),
+             "draft": {"attachments": [{"document_id": "shared-doc",
+                                         "storage_key": "uploads/v2.pdf"}]}}
+    if reference == "source":
+        draft["draft"]["attachments"] = []
+    if reference == "storage":
+        draft.pop("source_document_id")
+        draft["draft"]["attachments"] = [{"storage_key": "uploads/v1.pdf"}]
+    drafts = [] if reference in {"version", "none"} else [draft]
+    deleted, purged, updated = [], [], []
+    stop = asyncio.Event()
+
+    def page(items):
+        return lambda **kwargs: {"items": items, "total": len(items)}
+
+    async def delete(*args):
+        deleted.append(args)
+
+    async def finish(*args):
+        stop.set()
+        return {}
+
+    async def noop(*args, **kwargs):
+        return 0
+
+    lifecycle = SimpleNamespace(
+        list_documents_page=lambda **kwargs: {
+            "documents": [{"document_id": "shared-doc"}] if reference == "version" else [],
+            "total": 1 if reference == "version" else 0},
+        list_versions=lambda _doc: [{"publication_status": "PUBLISHED", "status": "INDEXED"}],
+        purge_document=purged.append,
+    )
+    runtime = SimpleNamespace(
+        draft_store_service=SimpleNamespace(list_page=page(drafts)),
+        task_store=SimpleNamespace(
+            list_page=page([{"task_id": "expired", "attachments": [attachment]}]),
+            update=lambda *args, **kwargs: updated.append((args, kwargs))),
+        lifecycle_service=lifecycle,
+    )
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setattr(cleanup, "seconds_until_daily_cleanup", lambda: 0)
+    monkeypatch.setattr(cleanup, "MinioUploadService", lambda: SimpleNamespace(
+        delete_document=delete, cleanup_objects_older_than=noop))
+    monkeypatch.setattr(cleanup, "_cleanup_deleted_drafts", noop)
+    monkeypatch.setattr(cleanup, "cleanup_expired_admin_documents", noop)
+    monkeypatch.setattr(cleanup, "_cleanup_orphaned_storage", finish)
+
+    asyncio.run(asyncio.wait_for(cleanup.cleanup_temporary_materials(runtime, stop), 2))
+
+    if reference == "none":
+        assert deleted == [("uploads/v1.pdf", "shared-doc")]
+        assert purged == ["shared-doc"]
+        assert updated[0][1]["status"] == "EXPIRED"
+    else:
+        assert deleted == []
+        assert purged == []
+        assert updated == []
 
 
 def test_reference_write_and_orphan_scan_are_serialized(monkeypatch):

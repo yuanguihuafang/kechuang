@@ -36,6 +36,7 @@ class UploadResponse(BaseModel):
     duplicate: bool = False
     version: int = 1
     version_id: str | None = None
+    error_code: str | None = None
     error: str | None = None
 
 
@@ -64,4 +65,5 @@ class PerceptionResult(BaseModel):
     tables: list[dict[str, Any]] = Field(default_factory=list)
     blocks: list[DocumentBlock] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    error_code: str | None = None
     error: str | None = None

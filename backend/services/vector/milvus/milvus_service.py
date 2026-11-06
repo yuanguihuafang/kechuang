@@ -1465,19 +1465,20 @@ class MilvusService:
             expr += f' && user_id == "{_escape_expr_value(user_id)}"'
         self._with_collection_recovery_retry(lambda: (collection.delete(expr), collection.flush()))
 
-    @_fenced_write
-    def delete_by_version_id(self, version_id: str, user_id: str | None = None) -> None:
-        """兼容旧生命周期入口；向量层按 document_id 删除。"""
-        collection = self._existing_collection()
-        if collection is None:
-            return
-        document_id = version_id.rsplit(":v", 1)[0]
-        expr = f'document_id == "{_escape_expr_value(document_id)}"'
-        if getattr(self, "requires_user_id", False):
-            if not user_id:
-                raise ValueError("删除私有知识必须提供 user_id")
-            expr += f' && user_id == "{_escape_expr_value(user_id)}"'
-        self._with_collection_recovery_retry(lambda: (collection.delete(expr), collection.flush()))
+    @staticmethod
+    def _current_version_document_id(version_id: str, active_version_id: str | None) -> str:
+        # 当前 schema 只有文档索引；调用边界必须先从生命周期核实活动版本。
+        document_id, separator, number = version_id.rpartition(":v")
+        if (not active_version_id or version_id != active_version_id or not document_id
+                or not separator or not number.isdigit() or int(number) < 1):
+            raise ValueError("只有已核实的活动版本才能操作当前文档向量")
+        return document_id
+
+    def delete_by_version_id(
+        self, version_id: str, user_id: str | None = None, *, active_version_id: str | None = None
+    ) -> None:
+        document_id = self._current_version_document_id(version_id, active_version_id)
+        self.delete_by_document_id(document_id, user_id)
 
     @_fenced_write
     def delete_by_mysql_id(self, mysql_id: str, user_id: str | None = None) -> None:
@@ -1608,11 +1609,12 @@ class MilvusService:
         return len({record_id for record_id in record_ids if record_id})
 
     def set_publication_status_by_version_id(
-        self, version_id: str, publication_status: str, user_id: str | None = None
+        self, version_id: str, publication_status: str, user_id: str | None = None,
+        *, active_version_id: str | None = None,
     ) -> int:
         """更新版本可检索状态，保留 Milvus 向量供后续重新上架。"""
 
-        document_id = version_id.rsplit(":v", 1)[0]
+        document_id = self._current_version_document_id(version_id, active_version_id)
         return self.set_publication_status_by_document_id(document_id, publication_status, user_id)
 
     def set_publication_status_by_document_id(
@@ -1622,7 +1624,7 @@ class MilvusService:
         user_id: str | None = None,
         chunk_role: str | None = None,
     ) -> int:
-        """更新整份文档的可检索状态，保留所有版本向量。"""
+        """更新文档当前索引的可检索状态。"""
 
         expr = f'document_id == "{_escape_expr_value(document_id)}"'
         if chunk_role:

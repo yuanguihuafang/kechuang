@@ -28,10 +28,13 @@ _DRAFT_VERSION_KEY = "_draft_version"
 # platform_tasks.state 只保存运行状态和小型索引信息；正文、完整解析结果、向量
 # 和大段请求上下文必须放在 MinIO 或其他专用存储中。
 TASK_STATE_FIELDS = {
+    "task_type",
     "stage",
     "progress",
     "version_id",
     "storage_key",
+    "previous_version_id",
+    "previous_storage_key",
     "file_name",
     "scope_id",
     "user_id",
@@ -75,6 +78,8 @@ TASK_STATE_FIELDS = {
     "draft_preview",
     "draft_previews",
     "draft_status",
+    "draft_error_code",
+    "draft_error",
     "intent_candidates",
     "intent_knowledge_type",
     "lifecycle_action",

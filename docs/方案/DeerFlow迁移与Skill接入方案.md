@@ -22,7 +22,7 @@ OPIEos Gateway 应用层修改了合法内部认证 Header，并添加模型/工
 
 13 个科创 Skill 已迁到原生 `skills/public/kc-*`，避免 legacy custom 目录在用户拥有个人技能时不加载的问题；未修改存储器。`test_kechuang_skill_manifest.py` 验证两种用户场景。共享列表看 `/api/skills`，个人编辑列表 `/api/skills/custom` 不列公共技能。个人同名 Skill 优先，部署必须按实际用户核查，不擅自删除覆盖。
 
-科创 Backend 到 DeerFlow 的 HTTP 客户端现显式设置 `trust_env=False`，不将内部 Gateway 请求发送到系统 HTTP 代理。线上 3090 的 Agent owner UUID 为 `e458d2e2-30ad-46f8-86f9-535d0cdec89e`；OPIEos 必须从 `DEER_FLOW_HOME/users/<UUID>/agents/kechuang/` 加载其 Agent 资产，4090 Backend 通过 `DEERFLOW_AGENT_OWNER_USER_ID` 和两个 `X-DeerFlow-*` Header 指向该固定 Agent 用户，而不是把科创业务用户 ID 当作 OPIEos 用户。双服务器分步部署见[部署步骤](科创与DeerFlow双服务器迁移部署.md)。
+科创 Backend 到 DeerFlow 的 HTTP 客户端现显式设置 `trust_env=False`，不将内部 Gateway 请求发送到系统 HTTP 代理。线上 3090 的 Agent owner UUID 为 `e458d2e2-30ad-46f8-86f9-535d0cdec89e`；OPIEos 必须从 `DEER_FLOW_HOME/users/<UUID>/agents/kechuang/` 加载其 Agent 资产，4090 Backend 通过 `DEERFLOW_AGENT_OWNER_USER_ID` 和两个 `X-DeerFlow-*` Header 指向该固定 Agent 用户，而不是把科创业务用户 ID 当作 OPIEos 用户。双服务器分步部署见[部署步骤](../科创与DeerFlow双服务器迁移部署.md)。
 
 科创后端只使用 DeerFlow 问答编排，旧 Supervisor/intent/reasoning 执行图及专属提示词已删除。未启用或未配置时，聊天在处理附件前明确返回 503；执行失败也不切换旧链路。客服仍通过 `CONTACT_WECOM` 响应动作，不作为 MCP 工具。
 
@@ -662,7 +662,7 @@ DeerFlow 配置 MCP Server 或内置 Tool 时，只暴露稳定的业务接口�
 # backend/.env.local
 DEERFLOW_ENABLED=true
 DEERFLOW_BASE_URL=http://127.0.0.1:8001
-DEERFLOW_INTERNAL_AUTH_TOKEN=<与 DeerFlow DEER_FLOW_INTERNAL_AUTH_TOKEN 相同的运行时密钥>
+DEER_FLOW_INTERNAL_AUTH_TOKEN=<与 DeerFlow 端同名变量相同的运行时密钥>
 KC_MCP_ENABLED=true
 KC_MCP_PATH=/mcp
 KC_MCP_ALLOWED_HOSTS=localhost:*,127.0.0.1:*,host.docker.internal:*
@@ -696,7 +696,7 @@ DeerFlow 侧不要把 `backend` 地址写入 Skill，修改的是运行时 MCP �
 # 科创 backend 连接服务器 DeerFlow
 DEERFLOW_ENABLED=true
 DEERFLOW_BASE_URL=http://<deerflow-host>:<gateway-port>
-DEERFLOW_INTERNAL_AUTH_TOKEN=<与 DeerFlow DEER_FLOW_INTERNAL_AUTH_TOKEN 相同的运行时密钥>
+DEER_FLOW_INTERNAL_AUTH_TOKEN=<与 DeerFlow 端同名变量相同的运行时密钥>
 # 可选：仅当目标 Gateway 另有 Bearer API Key 认证要求时配置，不替代内部 Token
 DEERFLOW_API_KEY=<optional-runtime-secret>
 

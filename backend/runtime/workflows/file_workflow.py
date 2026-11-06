@@ -30,6 +30,10 @@ PARSE_FAILURE_MESSAGE = "文件解析失败，请稍后重试"
 
 def _draft_failure(exc: Exception) -> tuple[str, str]:
     extraction_errors = {
+        "LLM_REFUSAL": "模型服务拒绝处理这份资料，未生成草稿。请联系模型供应商排查，或更换字段提取模型；无需重新上传或解析。",
+        "DRAFT_INVALID_JSON": "模型返回的 JSON 格式或字段结构错误，纠正重试后仍失败，请重新提取字段。",
+        "LLM_OUTPUT_EMPTY": "模型返回空内容，纠正重试后仍失败，请重新提取字段。",
+        "LLM_OUTPUT_TRUNCATED": "模型输出被截断，纠正重试后仍失败，请缩短材料或检查模型输出限制。",
         "DRAFT_FIELDS_EMPTY": "模型未提取到有效业务字段，请检查解析原文后重新提取。",
         "DRAFT_SOURCE_EMPTY": "解析原文和文本块均为空，请先重新解析文档。",
         "DRAFT_LLM_NOT_CONFIGURED": "字段提取模型未配置，请检查模型服务配置。",
@@ -210,12 +214,15 @@ class FileWorkflowService:
                 task_type="document_ingestion",
                 status="FAILED",
                 operation_state=OperationState.FAILED.value,
+                stage="failed",
+                error_code=result.get("error_code"),
                 error=result.get("error"),
             )
             self._audit(
                 "knowledge_upload_completed",
                 task_id=task.get("task_id"),
                 status="FAILED",
+                error_code=result.get("error_code"),
                 error=result.get("error", "上传失败"),
                 duration_ms=round((time.perf_counter() - started_at) * 1000, 2),
                 **self._audit_context(
@@ -292,6 +299,10 @@ class FileWorkflowService:
         task = self._require(task_id)
         if task.get("status") not in {"UPLOADED", "PARSING", "RUNNING"}:
             return {"result": self._failure(task_id, "INVALID_STAGE", "当前任务不是待解析状态")}
+        try:
+            self.validate_task_source(task)
+        except ValueError:
+            return {"result": self._failure(task_id, "STALE_SOURCE", "任务引用的附件版本已失效，请从当前文档重新操作")}
         self.task_store.update(
             task_id,
             status="PARSING",
@@ -322,7 +333,8 @@ class FileWorkflowService:
                 )
                 return {
                     "result": self._failure(
-                        task_id, "PARSE_FAILED", result.get("error", "解析失败")
+                        task_id, result.get("error_code") or "PARSE_FAILED",
+                        result.get("error", "解析失败"),
                     )
                 }
             if self.lifecycle_store and task.get("version_id"):
@@ -378,6 +390,7 @@ class FileWorkflowService:
             )
             return {"result": self._failure(task_id, "PARSE_FAILED", PARSE_FAILURE_MESSAGE)}
 
+    @serialize_storage_references
     async def _build_draft_in_background(
         self, task_id: str, task: dict[str, Any], result: dict[str, Any], preview_text: str
     ) -> None:
@@ -385,6 +398,10 @@ class FileWorkflowService:
 
         try:
             # 管理台保留 admin 身份；字段提取服务默认只提取草稿所需字段。
+            self.validate_task_source(task)
+            if any(result.get(key) != task.get(key) for key in ("document_id", "storage_key")
+                   if task.get(key)):
+                raise ValueError("STALE_SOURCE")
             draft_task = task
             service = (
                 self.structured_draft
@@ -424,6 +441,10 @@ class FileWorkflowService:
                     draft_error=None,
                 )
         except Exception as exc:  # 草稿辅助失败不影响解析确认
+            if isinstance(exc, ValueError) and str(exc) == "STALE_SOURCE":
+                self._failure(task_id, "STALE_SOURCE", "任务引用的附件版本已失效，请从当前文档重新操作")
+                self.task_store.update(task_id, draft_status="FAILED", draft_error_code="STALE_SOURCE")
+                return
             error_code, error = _draft_failure(exc)
             current = self.task_store.get(task_id)
             if current and current.get("status") in {"WAITING_CONFIRM", "WAITING_DRAFT_CONFIRM"}:
@@ -444,13 +465,18 @@ class FileWorkflowService:
                 **self._audit_context(task),
             )
 
+    @serialize_storage_references
     async def regenerate_draft(self, task_id: str) -> dict[str, Any]:
         """为已解析但尚未生成草稿的历史任务补生成草稿。"""
         task = self._require(task_id)
         try:
+            self.validate_task_source(task)
             result = await self._storage().load_parse_result(str(task.get("document_id") or ""))
             if not result:
                 raise ValueError("当前任务没有可用的解析结果")
+            if any(result.get(key) != task.get(key) for key in ("document_id", "storage_key")
+                   if task.get(key)):
+                raise ValueError("STALE_SOURCE")
             self.task_store.update(
                 task_id,
                 draft_status="RUNNING",
@@ -460,7 +486,10 @@ class FileWorkflowService:
             await self._build_draft_in_background(
                 task_id, task, result, str(task.get("preview_text") or "")
             )
-        except Exception:  # 后台任务必须落最终状态
+        except Exception as exc:  # 后台任务必须落最终状态
+            if isinstance(exc, ValueError) and str(exc) == "STALE_SOURCE":
+                self._failure(task_id, "STALE_SOURCE", "任务引用的附件版本已失效，请从当前文档重新操作")
+                return self.task_store.update(task_id, draft_status="FAILED", draft_error_code="STALE_SOURCE") or task
             logger.exception("字段提取任务准备失败: task_id=%s", task_id)
             self.task_store.update(
                 task_id,
@@ -518,7 +547,7 @@ class FileWorkflowService:
         document_id = str(task.get("document_id") or "")
         if not document_id:
             raise ValueError("索引任务缺少 document_id")
-        version = self.lifecycle_store.get_version(str(task.get("version_id") or "")) if self.lifecycle_store else None
+        version = self.validate_task_source(task)
         confirmed = ((version or {}).get("artifact_refs") or {}).get("confirmed_index_request")
         if confirmed and confirmed["task_id"] == task_id:
             raise RuntimeError("已成功确认的正文不可覆盖，请创建新的确认任务")
@@ -566,6 +595,10 @@ class FileWorkflowService:
         images_confirmed = bool(state.get("images_confirmed"))
         identity = state["identity"]
         task = self._require(task_id)
+        try:
+            version = self.validate_task_source(task)
+        except ValueError:
+            return {"result": self._failure(task_id, "STALE_SOURCE", "任务引用的附件版本已失效，请从当前文档重新操作")}
         expected_identity = {
             "user_id": str(task.get("user_id") or ""),
             "user_role": str(task.get("user_role") or ""),
@@ -600,7 +633,6 @@ class FileWorkflowService:
                     "确认索引前必须明确资料类型：企业、需求、成果、专家或技术方案",
                 )
             }
-        version = self.lifecycle_store.get_version(str(task.get("version_id") or "")) if self.lifecycle_store else None
         if not version or any(
             version.get(key) != task.get(key)
             for key in ("document_id", "version_id", "scope_id", "knowledge_type", "user_id")
@@ -732,36 +764,49 @@ class FileWorkflowService:
         previous_storage_key = task.get("previous_storage_key")
         if not previous_version_id or not previous_storage_key:
             return None
+        try:
+            replacement = self.validate_task_source(task)
+        except ValueError:
+            return {"status": "SKIPPED", "reason": "STALE_SOURCE"}
+        if not replacement or replacement.get("publication_status") != "PUBLISHED":
+            return {"status": "SKIPPED", "reason": "REPLACEMENT_NOT_PUBLISHED"}
+        previous = self.lifecycle_store.get_version(str(previous_version_id))
+        if (not previous or previous.get("_is_current") is not False
+                or previous.get("document_id") != task.get("document_id")
+                or previous.get("storage_key") != previous_storage_key):
+            return {"status": "SKIPPED", "reason": "STALE_SOURCE"}
         if previous_storage_key == task.get("storage_key"):
-            return {"status": "OVERWRITTEN"}
+            return {"status": "SKIPPED", "reason": "SHARED_ORIGINAL"}
         if previous_version_id == task.get("version_id"):
-            await self._storage().delete_original_file(str(previous_storage_key))
-            return {"status": "DELETED", "storage_key": previous_storage_key}
+            return {"status": "SKIPPED", "reason": "ACTIVE_VERSION"}
+        payload = {
+            "document_id": task.get("document_id"), "version_id": previous_version_id,
+            "storage_key": previous_storage_key, "scope_id": task.get("scope_id", "public"),
+            "knowledge_type": task.get("knowledge_type"), "user_id": task.get("user_id", ""),
+            "replacement_version_id": task.get("version_id"),
+            "replacement_storage_key": task.get("storage_key"), "preserve_current_vectors": True,
+        }
         if self.outbox_repository is not None:
             event = self.outbox_repository.append(
                 f"version_cleanup:{task.get('document_id')}:{previous_version_id}",
                 "VERSION_CLEANUP",
-                {
-                    "document_id": task.get("document_id"),
-                    "version_id": previous_version_id,
-                    "storage_key": previous_storage_key,
-                    "scope_id": task.get("scope_id", "public"),
-                    "knowledge_type": task.get("knowledge_type"),
-                    "user_id": task.get("user_id", ""),
-                },
+                payload,
             )
             return {"status": "QUEUED", "event_id": event.get("event_id")}
-        knowledge_type = str(task.get("knowledge_type") or "").strip()
-        return await cleanup_document_version(self.adapter, self.lifecycle_store,
-            {
-                "document_id": task.get("document_id"),
-                "version_id": previous_version_id,
-                "storage_key": previous_storage_key,
-                "scope_id": task.get("scope_id", "public"),
-                "knowledge_type": knowledge_type,
-                "user_id": task.get("user_id", ""),
-            }
-        )
+        return await cleanup_document_version(self.adapter, self.lifecycle_store, payload)
+
+    def validate_task_source(self, task: dict[str, Any]) -> dict[str, Any] | None:
+        """文档级解析与向量仅接受活动版本，旧任务不得操作新版本资产。"""
+        if getattr(self, "lifecycle_store", None) is None:
+            return None
+        version = self.lifecycle_store.get_version(str(task.get("version_id") or ""))
+        if (not version or version.get("status") in {"PURGED", "RECYCLED"}
+                or version.get("_is_current") is False
+                or any(version.get(key) != task.get(key) for key in (
+                    "document_id", "version_id", "storage_key", "scope_id", "user_id"
+                ) if key in task)):
+            raise ValueError("STALE_SOURCE")
+        return version
 
     def status(self, task_id: str) -> dict[str, Any] | None:
         return self.task_store.get(task_id)

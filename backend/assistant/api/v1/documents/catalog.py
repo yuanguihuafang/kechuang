@@ -47,21 +47,18 @@ def build_documents_router(
             raise HTTPException(status_code=404, detail="资料不存在或不属于当前用户")
         return {"document": document, "versions": document.get("versions") or []}
 
-    @router.get(
-        "/api/v1/knowledge/documents/{document_id}/file",
-        summary="下载文档原文",
-        description="预览或下载保存的原始附件。",
-    )
-    async def download_document_file(
+    async def document_file(
         request: Request,
         document_id: str,
-        inline: bool = Query(default=False),
+        inline: bool,
+        *,
+        admin: bool = False,
     ) -> Response:
-        """下载原始文档；登录身份只从 Bearer Token 获取，公开文档允许匿名下载。"""
+        """复用原件读取；用户权限来自 Token，管理入口使用既有管理台边界。"""
 
         requested_user_id = str(getattr(request.state, "user_id", "") or "").strip()
         effective_role: str | None = None
-        if requested_user_id == "admin":
+        if admin or requested_user_id == "admin":
             effective_role = "admin"
         elif requested_user_id:
             _user_id, effective_role, _profile = identity_resolver.resolve(requested_user_id)
@@ -71,6 +68,11 @@ def build_documents_router(
         # 登录用户优先从生命周期记录解析，草稿记录只作为临时附件回退。
         if effective_role in {None, "external", "internal", "admin"}:
             versions = lifecycle.list_versions(document_id)
+            if admin:
+                # 管理台只下载当前记录，不能回退到已删除版本的历史附件。
+                if not versions or versions[0].get("status") in {"PURGED", "RECYCLED"}:
+                    raise HTTPException(status_code=404, detail="当前文档不存在或已移除")
+                versions = versions[:1]
             version = next(
                 (item for item in versions if item.get("status") not in {"PURGED", "RECYCLED"}),
                 None,
@@ -174,5 +176,26 @@ def build_documents_router(
             media_type=media_type,
             headers={"Content-Disposition": f"{disposition}; filename*=UTF-8''{quote(file_name)}"},
         )
+
+    @router.get(
+        "/api/v1/knowledge/documents/{document_id}/file",
+        summary="下载文档原文",
+        description="预览或下载保存的原始附件。",
+    )
+    async def download_document_file(
+        request: Request, document_id: str, inline: bool = Query(default=False),
+    ) -> Response:
+        return await document_file(request, document_id, inline)
+
+    @router.get(
+        "/api/v1/admin/documents/{document_id}/file",
+        summary="管理员下载当前文档原文",
+        description="沿用管理台访问边界，下载当前版本原件，不依赖普通用户登录状态。",
+        tags=["管理员接口"],
+    )
+    async def admin_download_document_file(
+        request: Request, document_id: str, inline: bool = Query(default=False),
+    ) -> Response:
+        return await document_file(request, document_id, inline, admin=True)
 
     return router

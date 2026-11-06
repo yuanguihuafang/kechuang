@@ -11,6 +11,11 @@ from admin.api.v1.admin import build_admin_router
 from admin.service import AdminService
 
 
+@pytest.fixture(autouse=True)
+def _isolate_database_url(monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+
+
 class _TaskStore:
     def __init__(self, task):
         self.task = dict(task)
@@ -142,6 +147,7 @@ def test_field_extraction_can_run_again_after_completion_but_not_concurrently(st
 
     workflow = SimpleNamespace(
         status=lambda _task_id: dict(store.task),
+        validate_task_source=lambda _task: None,
         task_store=store,
         regenerate_draft=regenerate,
     )
@@ -187,6 +193,7 @@ def test_field_extraction_uses_selected_knowledge_type_and_clears_stale_failure(
 
     workflow = SimpleNamespace(
         status=lambda _task_id: dict(store.task),
+        validate_task_source=lambda _task: None,
         task_store=store,
         regenerate_draft=regenerate,
     )
@@ -215,6 +222,7 @@ def test_field_extraction_without_knowledge_type_keeps_draft_empty_without_failu
     calls = []
     workflow = SimpleNamespace(
         status=lambda _task_id: dict(store.task),
+        validate_task_source=lambda _task: None,
         task_store=store,
         regenerate_draft=lambda _task_id: calls.append(_task_id),
     )
@@ -242,6 +250,7 @@ def test_missing_knowledge_type_does_not_clear_an_active_field_extraction():
     store = _TaskStore(task)
     workflow = SimpleNamespace(
         status=lambda _task_id: dict(store.task),
+        validate_task_source=lambda _task: None,
         task_store=store,
         regenerate_draft=lambda _task_id: None,
     )
@@ -268,6 +277,7 @@ def test_explicit_draft_regeneration_does_not_reuse_ready_draft():
     store = _TaskStore({"task_id": "task-1", "status": "WAITING_DRAFT_CONFIRM"})
     builder = _DraftBuilder()
     workflow = object.__new__(FileWorkflowService)
+    workflow.lifecycle_store = None
     workflow.task_store = store
     workflow.structured_draft = builder
     workflow.knowledge_draft = builder
@@ -300,6 +310,7 @@ def test_draft_provider_timeout_is_saved_as_readable_failure_and_audited(caplog)
     store = _TaskStore({"task_id": "task-1", "status": "WAITING_DRAFT_CONFIRM"})
     audit_events = []
     workflow = object.__new__(FileWorkflowService)
+    workflow.lifecycle_store = None
     workflow.task_store = store
     workflow.structured_draft = _DraftBuilder()
     workflow.knowledge_draft = workflow.structured_draft
@@ -331,6 +342,7 @@ def test_empty_field_extraction_has_a_specific_failure_and_audit_event():
     store = _TaskStore({"task_id": "task-1", "status": "WAITING_DRAFT_CONFIRM"})
     audit_events = []
     workflow = object.__new__(FileWorkflowService)
+    workflow.lifecycle_store = None
     workflow.task_store = store
     workflow.structured_draft = _DraftBuilder()
     workflow.knowledge_draft = workflow.structured_draft
@@ -383,6 +395,7 @@ def test_real_admin_extraction_failure_is_audited_without_creating_blank_drafts(
     store = _TaskStore(task)
     audit = []
     workflow = object.__new__(FileWorkflowService)
+    workflow.lifecycle_store = None
     workflow.task_store = store
     workflow.knowledge_draft = KnowledgeDocumentDraftService(draft_store)
     workflow.structured_draft = None
@@ -454,6 +467,7 @@ def test_admin_confirmation_replaces_saved_attachment_text_with_edited_blocks(mo
     task_store = _TaskStore(task)
     workflow = SimpleNamespace(
         status=lambda _task_id: dict(task),
+        validate_task_source=lambda _task: None,
         task_store=task_store,
         cleanup_previous_version=lambda _task: asyncio.sleep(0, result={}),
     )
@@ -520,6 +534,7 @@ def test_admin_confirmation_prefers_saved_edited_chunks_over_stale_draft_blocks(
     }
     workflow = SimpleNamespace(
         status=lambda _task_id: dict(task),
+        validate_task_source=lambda _task: None,
         task_store=_TaskStore(task),
         cleanup_previous_version=lambda _task: asyncio.sleep(0, result={}),
     )
@@ -579,6 +594,7 @@ def test_admin_confirmation_uses_edited_parse_text_when_no_chunks_were_generated
     }
     workflow = SimpleNamespace(
         status=lambda _task_id: dict(task),
+        validate_task_source=lambda _task: None,
         task_store=_TaskStore(task),
         cleanup_previous_version=lambda _task: asyncio.sleep(0, result={}),
     )
@@ -649,6 +665,7 @@ def test_republishing_multiple_admin_drafts_replaces_each_old_vector(monkeypatch
     task_store = _TaskStore(task)
     workflow = SimpleNamespace(
         status=lambda _task_id: dict(task),
+        validate_task_source=lambda _task: None,
         task_store=task_store,
         cleanup_previous_version=lambda _task: asyncio.sleep(0, result={}),
     )
@@ -737,6 +754,7 @@ def test_published_confirmation_retry_resumes_cleanup_without_republishing(monke
     task_store = _TaskStore(task)
     workflow = SimpleNamespace(
         status=lambda _task_id: dict(task),
+        validate_task_source=lambda _task: None,
         task_store=task_store,
         cleanup_previous_version=lambda _task: asyncio.sleep(0, result={}),
     )

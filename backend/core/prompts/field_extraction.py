@@ -1,6 +1,6 @@
 """智能问答草稿专用字段提取 Prompt。"""
 
-SMART_QA_FIELD_EXTRACTION_PROMPT_VERSION = "smart-qa-v16"
+SMART_QA_FIELD_EXTRACTION_PROMPT_VERSION = "smart-qa-v17"
 
 FIELD_EXTRACTION_PROFILES = {
     "enterprise": ("企业库", "重点提取企业基本信息、主营业务、经营范围、联系方式和公开企业画像。"),
@@ -98,6 +98,9 @@ def build_smart_qa_field_extraction_system(
         f"{focus}只能提取当前{label}字段，不要输出其他知识库字段。"
         f"{multiple}只输出 JSON，字段为 title、fields、summary、missing_fields、"
         "optional_questions、confidence。fields 使用给定的 MySQL 物理字段名；缺失信息不要猜测。"
+        'JSON 结构示例：{"title":"名称","fields":{},"summary":"摘要",'
+        '"missing_fields":[],"optional_questions":[],"confidence":0.5}；'
+        "示例仅说明结构，fields 必须填写实际提取的业务字段。"
         "每个字段只保留最准确的一项值，数值、日期、单位、型号和专有名词必须按原文保留。"
         "各字段必须严格按字段语义填写，字段之间不要重复；描述字段只保留该字段对应的事实和内容片段，"
         "禁止把整篇解析原文、整页文字或所有字段拼接进描述字段，无法确认归属时留空。"

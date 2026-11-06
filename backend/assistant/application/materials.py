@@ -25,6 +25,7 @@ from assistant.application.quick_entry_context import (
 )
 from assistant.integrations.deerflow_adapter import iter_public_deerflow_events
 from core.contracts.chat import ChatRequest, ChatResponse
+from core.contracts.errors import ErrorCode
 from core.contracts.flows import DEMAND_TYPE_OPTIONS
 from runtime.config import get_settings
 from runtime.container import GatewayRuntime
@@ -55,16 +56,10 @@ def _material_token_event(phase: str, token: str) -> dict[str, str]:
 
 def _material_limit_answer(error: object) -> str | None:
     message = str(error or "")
-    if (
-        "50页" in message
-        or ("页" in message and "限制" in message)
-        or "50MB" in message
-        or "大小限制" in message
-        or "超过限制" in message
-    ):
-        return (
-            "本次请求未完成：文件超出处理限制：单个文件不能超过50MB或50页，请压缩或拆分后重新上传。"
-        )
+    if "50MB" in message or "大小限制" in message:
+        return "本次请求未完成：单个文件不能超过50MB，请压缩或拆分后重新上传。"
+    if ("页" in message and "限制" in message) or "超过限制" in message:
+        return "本次请求未完成：解析服务返回文件处理限制，请拆分文件后重新上传。"
     return None
 
 
@@ -397,6 +392,11 @@ async def parse_chat_material(
         )
         upload_body = upload_result.model_dump(mode="json")
         if upload_body.get("status") != "SUCCESS":
+            if upload_body.get("error_code") == ErrorCode.UNSUPPORTED_FILE_TYPE:
+                raise HTTPException(
+                    status_code=415,
+                    detail={"code": ErrorCode.UNSUPPORTED_FILE_TYPE, "message": upload_body["error"]},
+                )
             limit_answer = _material_limit_answer(upload_body.get("error"))
             if limit_answer:
                 return _material_limit_result(
@@ -511,6 +511,15 @@ async def parse_chat_material(
         )
         parsed_body = parsed.model_dump(mode="json")
         if parsed_body.get("status") != "SUCCESS":
+            if parsed_body.get("error_code") == ErrorCode.UNSUPPORTED_FILE_TYPE:
+                task_store.update(
+                    material_task["task_id"], status="FAILED", stage="failed", progress=100,
+                    error_code=ErrorCode.UNSUPPORTED_FILE_TYPE, error=parsed_body["error"],
+                )
+                raise HTTPException(
+                    status_code=415,
+                    detail={"code": ErrorCode.UNSUPPORTED_FILE_TYPE, "message": parsed_body["error"]},
+                )
             limit_answer = _material_limit_answer(parsed_body.get("error"))
             if limit_answer:
                 try:

@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import logging
 import mimetypes
+import os
 import re
 import shutil
 import tempfile
@@ -28,6 +29,7 @@ from agents.perception_agent.schemas import (
     TaskSubmitResponse,
     UploadResponse,
 )
+from core.contracts.errors import ErrorCode
 from runtime.config import get_settings
 from runtime.workflows.task_runner import SupervisorTaskRunner
 from runtime.workflows.task_store import SupervisorTaskStore
@@ -44,6 +46,8 @@ from services.document_parsing.mineru_parser import (
 from services.observability.logging import get_logger, log_event, setup_logger, trace_span
 from services.observability.metrics import metrics
 from services.observability.trace_context import get_trace_context
+from services.persistence.document_lifecycle import DocumentLifecycleStore
+from services.persistence.retention import serialize_storage_references, storage_reference_guard
 from services.storage.minio.image_service import perception_image_url
 from services.storage.minio.minio_storage import StorageObjectTooLargeError
 
@@ -57,7 +61,6 @@ logger = setup_logger("perception", log_path=LOG_FILE)
 agent_logger = get_logger("perception", "agent")
 
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
-MAX_DOCUMENT_PAGES = 50
 STREAM_CHUNK_BYTES = 1024 * 1024
 SUPPORTED_EXTENSIONS = {
     "pdf",
@@ -74,13 +77,27 @@ SUPPORTED_EXTENSIONS = {
     "md",
     "txt",
 }
-PPT_UNSUPPORTED_MESSAGE = "暂不支持，请转换为 .pptx 后上传"
 UPLOAD_FAILURE_MESSAGE = "文件上传失败，请稍后重试"
 PARSE_FAILURE_MESSAGE = "文件解析失败，请稍后重试"
 
 
 def unsupported_file_message(suffix: str) -> str:
-    return PPT_UNSUPPORTED_MESSAGE if suffix.lower() == "ppt" else "不支持的文件类型"
+    suffix = suffix.lower()
+    conversion = {
+        "doc": ("Word/WPS", "docx"),
+        "ppt": ("PowerPoint/WPS", "pptx"),
+        "xls": ("Excel/WPS", "xlsx"),
+    }
+    if suffix in conversion:
+        application, target = conversion[suffix]
+        return f"暂不支持 .{suffix} 文件，请使用 {application} 另存为 .{target} 后上传，不能只修改文件后缀。"
+    if suffix in {"zip", "rar", "7z", "gz", "tar"}:
+        return "暂不支持压缩包，请先解压，再上传其中的 PDF、DOCX、PPTX、XLSX、图片、Markdown 或 TXT 文件。"
+    file_type = f".{suffix} 文件" if suffix else "无扩展名文件"
+    return (
+        f"暂不支持{file_type}，请将文档另存为 PDF、DOCX、PPTX、XLSX、Markdown 或 TXT，"
+        "图片转换为 JPG、JPEG、PNG、WEBP、BMP、TIF 或 TIFF 后上传，不能只修改文件后缀。"
+    )
 
 
 app = APIRouter(tags=["文档解析"])
@@ -170,6 +187,10 @@ def _storage() -> object:
     return storage
 
 
+def _document_lifecycle() -> DocumentLifecycleStore | None:
+    return DocumentLifecycleStore() if os.getenv("DATABASE_URL", "").strip() else None
+
+
 logger.info(
     "Perception 服务初始化完成",
     extra={
@@ -206,34 +227,21 @@ class DocumentLimitError(ValueError):
         self.size = size
 
 
-def _document_page_count(path: Path) -> int | None:
+def validate_document_limits(path: Path, file_size: int) -> None:
+    if file_size > MAX_UPLOAD_BYTES:
+        raise DocumentLimitError("文件超过限制：单个文件不能超过50MB", file_size)
     suffix = path.suffix.lower().lstrip(".")
     if suffix == "pdf":
         import fitz
 
-        with fitz.open(path) as document:
-            return int(document.page_count)
-    if suffix == "pptx":
+        with fitz.open(path):
+            pass
+    elif suffix == "pptx":
         try:
-            with ZipFile(path) as archive:
-                return sum(
-                    name.startswith("ppt/slides/slide") and name.endswith(".xml")
-                    for name in archive.namelist()
-                )
+            with ZipFile(path):
+                pass
         except BadZipFile:
             raise ValueError("PPTX 文件损坏") from None
-    return None
-
-
-def validate_document_limits(path: Path, file_size: int) -> None:
-    if file_size > MAX_UPLOAD_BYTES:
-        raise DocumentLimitError("文件超过限制：单个文件不能超过50MB", file_size)
-    page_count = _document_page_count(path)
-    if page_count is not None and page_count > MAX_DOCUMENT_PAGES:
-        raise DocumentLimitError(
-            f"文件超过限制：PDF/PPT最多支持50页，当前文件有{page_count}页",
-            file_size,
-        )
 
 
 def _copy_stream_to_path(
@@ -296,6 +304,19 @@ async def _run_agent_path(
         return await agent.run_path(**kwargs)
 
 
+def _replace_image_url(value: object, old_url: str, new_url: str) -> object:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            value[key] = _replace_image_url(child, old_url, new_url)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            value[index] = _replace_image_url(child, old_url, new_url)
+    elif isinstance(value, str):
+        return re.sub(re.escape(old_url) + r'''(?=$|[\s)\]<>"'?#])''', lambda _: new_url, value)
+    return value
+
+
+@serialize_storage_references
 async def persist_image_assets(result: PerceptionResult) -> PerceptionResult:
     """将完整 MinerU 产物与图片关联清单持久化到 MinIO。"""
 
@@ -305,6 +326,9 @@ async def persist_image_assets(result: PerceptionResult) -> PerceptionResult:
     if not isinstance(images, list):
         return result
     storage = _storage()
+    load_images = getattr(storage, "load_image_manifest", None)
+    previous_images = await load_images(result.document_id) if callable(load_images) else []
+    previous_by_id = {str(item["image_id"]): item for item in previous_images if item.get("image_id")}
     artifact_keys = await persist_mineru_artifacts(result, storage)
     result.metadata.setdefault("artifact_refs", {}).update(artifact_keys)
     manifest: list[dict[str, object]] = []
@@ -316,6 +340,20 @@ async def persist_image_assets(result: PerceptionResult) -> PerceptionResult:
         if not storage_key:
             continue
         image_id = str(asset["image_id"])
+        previous = previous_by_id.get(image_id)
+        if previous and previous.get("minio_object_key") != storage_key:
+            # 旧发布正文通过 image_id 取图，新的 attempt 不可改写旧 ID 的映射。
+            old_url = str(asset.get("url") or perception_image_url(result.document_id, image_id))
+            image_id = f"{image_id}_{uuid.uuid4().hex}"
+            asset["image_id"] = image_id
+            new_url = perception_image_url(result.document_id, image_id)
+            _replace_image_url(result.metadata, old_url, new_url)
+            for field in ("raw_text", "text"):
+                text = getattr(result, field, None)
+                if isinstance(text, str):
+                    setattr(result, field, _replace_image_url(text, old_url, new_url))
+            for block in getattr(result, "blocks", []):
+                block.text = _replace_image_url(block.text, old_url, new_url)
         asset["minio_object_key"] = storage_key
         asset["url"] = perception_image_url(result.document_id, image_id)
         manifest.append(
@@ -332,8 +370,11 @@ async def persist_image_assets(result: PerceptionResult) -> PerceptionResult:
                 "content_type": asset.get("contentType", "application/octet-stream"),
             }
         )
-    # 重新解析同一 document_id 时也要覆盖为空清单，避免 Retrieval 返回过期图片。
-    await storage.save_image_manifest(result.document_id, manifest)
+    # 解析不是发布；保留旧发布正文与封面使用的图片路由。
+    await storage.save_image_manifest(result.document_id, [
+        *previous_images,
+        *(item for item in manifest if item["image_id"] not in previous_by_id),
+    ])
     for field in ("raw_text", "text"):
         text = getattr(result, field, None)
         if isinstance(text, str):
@@ -342,6 +383,8 @@ async def persist_image_assets(result: PerceptionResult) -> PerceptionResult:
                 field,
                 normalize_markdown_image_references(text, images),
             )
+    for block in getattr(result, "blocks", []):
+        block.text = normalize_markdown_image_references(block.text, images)
     return result
 
 
@@ -435,6 +478,9 @@ def _prune_removed_parse_images(
         object_key = str(item.get("minio_object_key") or "")
         if not object_key or image_id in processed_ids:
             continue
+        if current.get("storage_key"):
+            # 新解析只编辑本次图片，manifest 中其他 attempt 可能仍用于已发布封面。
+            continue
         artifact = artifact_by_key.get(object_key)
         reference = _normalize_image_reference(artifact.get("relative_path")) if artifact else ""
         if reference and not _contains_image_reference(normalized_text, reference):
@@ -495,17 +541,39 @@ def _prune_removed_parse_images(
     return updated_metadata, retained_manifest, retained_artifacts, sorted(removed_keys)
 
 
-async def persist_parse_result(result: PerceptionResult) -> PerceptionResult:
-    """保存结构化解析结果，避免页面刷新后只能看到文件而无法恢复 blocks。"""
+async def _preserve_published_parse_source(storage: object, document_id: str) -> bool:
+    lifecycle = _document_lifecycle()
+    published = [version for version in lifecycle.list_versions(document_id)
+                 if version.get("publication_status") == "PUBLISHED"] if lifecycle else []
+    shared_key = f"derived/{document_id}/mineru/parse-result.json"
+    legacy = [version for version in published
+              if (version.get("artifact_refs") or {}).get("parse_result") == shared_key]
+    if legacy:
+        previous = await storage.load_parse_result(document_id)
+        if not previous or any(version.get("storage_key") != previous.get("storage_key") for version in legacy):
+            raise ValueError("已发布版本的解析来源不匹配，拒绝覆盖")
+        previous_key = await storage.save_index_request(document_id, f"parse-{uuid.uuid4().hex}", previous)
+        for version in legacy:
+            if lifecycle.update_version(version["version_id"], artifact_refs={"parse_result": previous_key},
+                                        expected_version=version) is None:
+                raise RuntimeError("已发布解析来源快照保存失败")
+    return bool(published)
 
+
+@serialize_storage_references
+async def persist_parse_result(result: PerceptionResult) -> PerceptionResult:
+    """保存不可变来源快照与供当前编辑的文档级副本。"""
     if result.document_id and result.status == "SUCCESS":
         storage = _storage()
         save_parse_result = getattr(storage, "save_parse_result", None)
         if save_parse_result is not None:
-            parse_result_key = await save_parse_result(
-                result.document_id, result.model_dump(mode="json")
+            await _preserve_published_parse_source(storage, result.document_id)
+            # 使用已有任务对象存储机制保存不可变解析快照；文档级文件仅供当前编辑。
+            snapshot_key = await storage.save_index_request(
+                result.document_id, f"parse-{uuid.uuid4().hex}", result.model_dump(mode="json")
             )
-            result.metadata["parse_result_key"] = parse_result_key
+            result.metadata["parse_result_key"] = snapshot_key
+            await save_parse_result(result.document_id, result.model_dump(mode="json"))
     return result
 
 
@@ -544,23 +612,13 @@ async def persist_mineru_artifacts(result: PerceptionResult, storage: object) ->
                     "size_bytes": artifact_path.stat().st_size,
                 }
             )
-        manifest_key = await storage.save_mineru_artifact_manifest(result.document_id, artifacts)
+        known_keys = {item["minio_object_key"] for item in artifacts}
+        retained_artifacts = [item for item in previous_artifacts
+                              if item.get("minio_object_key") not in known_keys]
+        manifest_key = await storage.save_mineru_artifact_manifest(
+            result.document_id, [*retained_artifacts, *artifacts]
+        )
         result.metadata["artifact_manifest_key"] = manifest_key
-        previous_keys = {
-            str(item.get("minio_object_key"))
-            for item in previous_artifacts
-            if isinstance(item, dict) and item.get("minio_object_key")
-        }
-        obsolete_keys = sorted(previous_keys.difference(uploaded_keys))
-        if obsolete_keys:
-            try:
-                await storage.delete_derived_objects(result.document_id, obsolete_keys)
-            except Exception:  # noqa: BLE001 - 新清单已提交，旧产物清理失败交给孤儿清理
-                agent_logger.exception(
-                    "旧 MinerU 产物清理失败: document_id=%s, count=%s",
-                    result.document_id,
-                    len(obsolete_keys),
-                )
         return artifact_keys
     except Exception:
         if uploaded_keys:
@@ -603,6 +661,7 @@ def finish_parse_task(task_id: str, result: PerceptionResult) -> PerceptionResul
         result_status=result.status,
         source_name=result.source_name,
         result_ref=(result.metadata or {}).get("artifact_manifest_key") or result.storage_key,
+        error_code=result.error_code,
         error=result.error,
     )
     return result.model_copy(update={"task_id": task_id})
@@ -629,6 +688,7 @@ async def _run_async_parse(task_id: str, operation: str, action: object) -> dict
             stage="completed" if result.status == "SUCCESS" else "failed",
             result_status=result.status,
             source_name=result.source_name,
+            error_code=result.error_code,
             error=result.error,
         )
         return task or {}
@@ -660,6 +720,13 @@ async def upload_document(
     document_id: str | None = Form(default=None),
 ) -> UploadResponse:
     """Perception 独立测试入口：保存原始文件，不解析、不建立向量索引。"""
+    async with storage_reference_guard():
+        return await _upload_document(file, scope_id, user_id, new_version, document_id)
+
+
+async def _upload_document(
+    file: UploadFile, scope_id: str, user_id: str, new_version: bool, document_id: str | None
+) -> UploadResponse:
 
     if type(scope_id).__name__ == "Form":
         scope_id = str(getattr(scope_id, "default", "public") or "public")
@@ -680,10 +747,11 @@ async def upload_document(
         user_id=user_id or None,
     )
     if file_name != (file.filename or "") or suffix not in SUPPORTED_EXTENSIONS:
+        invalid_name = file_name != (file.filename or "")
         error = (
-            unsupported_file_message(suffix)
-            if suffix == "ppt"
-            else "不支持的文件类型或文件名不合法"
+            "文件名不合法，请移除文件名中的路径后重新上传。"
+            if invalid_name
+            else unsupported_file_message(suffix)
         )
         return UploadResponse(
             status="FAILED",
@@ -691,6 +759,9 @@ async def upload_document(
             storage_key="",
             file_name=file_name,
             file_size=0,
+            error_code=(
+                ErrorCode.VALIDATION_ERROR if invalid_name else ErrorCode.UNSUPPORTED_FILE_TYPE
+            ),
             error=error,
         )
 
@@ -736,8 +807,15 @@ async def upload_document(
             logical_document_id = (
                 document_id or f"doc_{uuid.uuid4().hex[:8]}_{staged.content_hash[:16]}"
             )
-            # 普通资料不保留历史版本；同一 document_id 始终覆盖同一个原始对象。
             version = 1
+            if document_id:
+                originals = await storage.find_by_document_id(logical_document_id)
+                versions = [int(item.get("version") or 1) for item in originals]
+                lifecycle = _document_lifecycle()
+                if lifecycle is not None:
+                    versions.extend(int(item.get("version_number") or 0) for item in
+                                    lifecycle.list_versions(logical_document_id))
+                version = max(versions, default=0) + 1
             storage_key, _ = await storage.upload_path(
                 staged.path,
                 file_name,
@@ -855,9 +933,14 @@ async def normalize_parse_result_images(document_id: str) -> dict[str, object]:
     description="保存指定文件的解析结果。",
 )
 async def update_parse_result(
-    document_id: str, payload: dict[str, object] = Body(...)
-) -> dict[str, object]:  # noqa: B008
+    document_id: str, payload: dict[str, object] = Body(...)  # noqa: B008
+) -> dict[str, object]:
     """保存用户编辑后的解析原文，并同步清理已删除的解析图片。"""
+    async with storage_reference_guard():
+        return await _update_parse_result(document_id, payload)
+
+
+async def _update_parse_result(document_id: str, payload: dict[str, object]) -> dict[str, object]:
 
     raw_text = payload.get("raw_text")
     if not isinstance(raw_text, str):
@@ -866,6 +949,7 @@ async def update_parse_result(
     if current is None:
         raise HTTPException(status_code=404, detail="当前文档没有已保存的解析结果")
     storage = _storage()
+    has_published = await _preserve_published_parse_source(storage, document_id)
     load_images = getattr(storage, "load_image_manifest", None)
     load_artifacts = getattr(storage, "load_mineru_artifact_manifest", None)
     image_manifest = await load_images(document_id) if callable(load_images) else []
@@ -874,6 +958,11 @@ async def update_parse_result(
     metadata, image_manifest, artifact_manifest, removed_keys = _prune_removed_parse_images(
         raw_text, current, image_manifest, artifact_manifest
     )
+    if has_published:
+        # 编辑中的删图不等于下架；发布来源可能仍引用本次要移除的图片。
+        image_manifest = await load_images(document_id) if callable(load_images) else []
+        artifact_manifest = await load_artifacts(document_id) if callable(load_artifacts) else []
+        removed_keys = []
     raw_text = normalize_markdown_image_references(
         raw_text,
         metadata.get("images", []) if isinstance(metadata, dict) else [],
@@ -919,6 +1008,19 @@ async def parse_document(request: PerceptionRequest) -> PerceptionResult:
     log_event(agent_logger, "parse_request", file_path=request.file_path)
     try:
         source_path = Path(request.file_path)
+        suffix = source_path.suffix.lstrip(".").lower()
+        if suffix not in SUPPORTED_EXTENSIONS:
+            return finish_parse_task(
+                task_id,
+                PerceptionResult(
+                    status="FAILED",
+                    source_name=source_path.name,
+                    document_id=request.document_id,
+                    storage_key=request.storage_key,
+                    error_code=ErrorCode.UNSUPPORTED_FILE_TYPE,
+                    error=unsupported_file_message(suffix),
+                ),
+            )
         validate_document_limits(source_path, source_path.stat().st_size)
         with metrics.stage("perception.parse"):
             result = await agent.run(request)
@@ -967,8 +1069,11 @@ async def parse_uploaded_document(
     log_event(agent_logger, "file_parse_start", document_id=document_id, file_name=file_name)
 
     if file_name != original_name or suffix not in SUPPORTED_EXTENSIONS:
+        invalid_name = file_name != original_name
         log_event(
-            agent_logger, "parse_upload_reject", reason="unsupported_file_type", suffix=suffix
+            agent_logger, "parse_upload_reject",
+            reason="invalid_file_name" if invalid_name else "unsupported_file_type",
+            suffix=suffix,
         )
         return finish_parse_task(
             task_id,
@@ -978,7 +1083,13 @@ async def parse_uploaded_document(
                 source_name=file_name,
                 document_id=document_id,
                 storage_key=storage_key,
-                error=unsupported_file_message(suffix),
+                error_code=(
+                    ErrorCode.VALIDATION_ERROR if invalid_name else ErrorCode.UNSUPPORTED_FILE_TYPE
+                ),
+                error=(
+                    "文件名不合法，请移除文件名中的路径后重新上传。"
+                    if invalid_name else unsupported_file_message(suffix)
+                ),
             ),
         )
 
@@ -1097,6 +1208,7 @@ async def parse_stored_document(
                         source_name=resolved_name,
                         document_id=document_id,
                         storage_key=storage_key,
+                        error_code=ErrorCode.UNSUPPORTED_FILE_TYPE,
                         error=unsupported_file_message(suffix),
                     ),
                 )

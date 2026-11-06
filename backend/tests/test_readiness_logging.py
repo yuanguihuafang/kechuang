@@ -49,7 +49,7 @@ def test_console_formatter_uses_rich_style_timestamp_level_and_source():
     record = logging.LogRecord(
         "mcp.server",
         logging.INFO,
-        r"D:\runtime\streamable_http.py",
+        __file__.replace("test_readiness_logging.py", "streamable_http.py"),
         831,
         "Terminating session: %s",
         (None,),

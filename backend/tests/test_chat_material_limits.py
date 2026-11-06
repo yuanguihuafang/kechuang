@@ -70,12 +70,13 @@ def test_chat_material_limit_is_returned_as_assistant_answer():
     assert "50MB" in result["answer"]
 
 
-def test_chat_material_size_and_page_limits_use_the_same_assistant_answer():
+def test_chat_material_size_and_upstream_limits_have_accurate_assistant_answers():
     size_answer = _material_limit_answer("文件超过限制：单个文件不能超过50MB")
     page_answer = _material_limit_answer("文件超过限制：PDF/PPT最多支持50页，当前文件有51页")
 
-    assert size_answer == page_answer
     assert (
         size_answer
-        == "本次请求未完成：文件超出处理限制：单个文件不能超过50MB或50页，请压缩或拆分后重新上传。"
+        == "本次请求未完成：单个文件不能超过50MB，请压缩或拆分后重新上传。"
     )
+    assert page_answer == "本次请求未完成：解析服务返回文件处理限制，请拆分文件后重新上传。"
+    assert _material_limit_answer("文件解析失败，请稍后重试") is None

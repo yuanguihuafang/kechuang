@@ -2,6 +2,7 @@ import asyncio
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
+from zipfile import ZipFile
 
 import pytest
 
@@ -12,6 +13,25 @@ from runtime.workflows.task_store import SupervisorTaskStore
 class _FailingAdapter:
     async def parse_document(self, _arguments):
         raise RuntimeError("/srv/mineru/private/input.pdf: dependency unavailable")
+
+
+@pytest.mark.parametrize("version", [
+    {"storage_key": "uploads/new.pdf", "status": "UPLOADED"},
+    {"storage_key": "uploads/old.pdf", "status": "PURGED"},
+    None,
+])
+def test_stale_parse_task_does_not_modify_replaced_document(tmp_path, version):
+    store = SupervisorTaskStore(tmp_path / "stale-tasks.json")
+    task = store.create(operation="file_ingestion", status="UPLOADED", document_id="doc",
+                        version_id="doc:v1", storage_key="uploads/old.pdf")
+    changed = []
+    workflow = FileWorkflowService(_FailingAdapter(), store, lifecycle_store=SimpleNamespace(
+        get_version=lambda _version: version,
+        update_version=lambda *args, **kwargs: changed.append((args, kwargs)),
+    ))
+    result = asyncio.run(workflow.parse(task["task_id"]))
+    assert result["error_code"] == "STALE_SOURCE"
+    assert changed == []
 
 
 def test_parse_failure_does_not_persist_exception_details(tmp_path):
@@ -69,10 +89,34 @@ def test_document_limits_reject_files_over_50mb(tmp_path):
         )
 
 
-def test_document_limits_reject_pdf_over_50_pages(monkeypatch, tmp_path):
-    import agents.perception_agent.routes as routes
+@pytest.mark.parametrize("extension", ["pdf", "pptx"])
+@pytest.mark.parametrize("page_count", [72, 201])
+def test_document_limits_accept_documents_over_50_pages(tmp_path, extension, page_count):
+    import fitz
 
-    monkeypatch.setattr(routes, "_document_page_count", lambda *_args: 51)
+    from agents.perception_agent import routes
 
-    with pytest.raises(routes.DocumentLimitError, match="50页"):
-        routes.validate_document_limits(tmp_path / "large.pdf", 1)
+    path = tmp_path / f"long.{extension}"
+    if extension == "pdf":
+        with fitz.open() as document:
+            for _ in range(page_count):
+                document.new_page()
+            document.save(path)
+    else:
+        with ZipFile(path, "w") as archive:
+            for page in range(1, page_count + 1):
+                archive.writestr(f"ppt/slides/slide{page}.xml", "<slide/>")
+
+    routes.validate_document_limits(path, path.stat().st_size)
+
+
+@pytest.mark.parametrize("extension", ["pdf", "pptx"])
+def test_document_limits_still_reject_corrupt_document_containers(tmp_path, extension):
+    import fitz
+
+    from agents.perception_agent import routes
+
+    path = tmp_path / f"corrupt.{extension}"
+    path.write_bytes(b"invalid document")
+    with pytest.raises((fitz.FileDataError, ValueError)):
+        routes.validate_document_limits(path, path.stat().st_size)

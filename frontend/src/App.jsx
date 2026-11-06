@@ -6,6 +6,7 @@ import { displayDraftFieldLabel } from './draftFieldLabels.js';
 import { draftFailureMessage } from './pages/documents/draftFailure.js';
 import { buildSavedChunksParseUpdate, removeBlankLines } from './pages/documents/parseResultSave.js';
 import { reparseResetState } from './pages/documents/reparseState.js';
+import { catalogStage, currentDocumentTask, currentDocumentVersion } from './pages/documents/documentStatus.js';
 import { createUuid } from './uuid.js';
 
 const displayError = (value, fallback = '未知错误') => errorMessage(value, fallback);
@@ -395,17 +396,6 @@ function buildFieldVisibilityBlocks(blocks, knowledgeType) {
   });
 }
 
-function catalogStage(document, task) {
-  if (task?.stage) return task.stage;
-  const status = String(document.active_version?.status || document.status || '').toUpperCase();
-  if (status === 'FAILED') return 'failed';
-  if (status === 'PARSING') return 'parse';
-  if (['WAITING_REVIEW', 'READY_TO_PUBLISH'].includes(status)) return 'confirm';
-  if (['INDEXING', 'INDEXED', 'PUBLISHED', 'UNPUBLISHED'].includes(status)) return 'index';
-  if (['RECYCLED', 'PURGED'].includes(status)) return 'deleted';
-  return 'upload';
-}
-
 export default function App() {
   const [identity, setIdentity] = useState(() => ({
     user_role: window.location.pathname.startsWith('/admin') ? 'admin' : 'external',
@@ -435,6 +425,7 @@ export default function App() {
   const [uploadTarget, setUploadTarget] = useState(null);
   const [uploaded, setUploaded] = useState(null);
   const [parsed, setParsed] = useState(null);
+  const [parseReadState, setParseReadState] = useState({ loading: false, error: '' });
   const [parsedDirty, setParsedDirty] = useState(false);
   const parsedDraftRef = useRef('');
   const [generatedChunks, setGeneratedChunks] = useState([]);
@@ -479,6 +470,7 @@ export default function App() {
   const healthRequestRef = useRef(0);
   const healthInFlightRef = useRef(null);
   const adminDocumentContextRef = useRef(null);
+  const adminDocumentRequestRef = useRef(0);
   const filesRefreshInFlightRef = useRef(null);
   const filesRefreshQueuedRef = useRef(null);
   const filesRefreshQueuedOptionsRef = useRef(null);
@@ -628,11 +620,12 @@ export default function App() {
 
   }
 
-  function updateRecord(document, patch) {
+  function updateRecord(document, patch, requestId = adminDocumentRequestRef.current) {
     const id = document.document_id;
     const next = { ...records, [id]: { ...records[id], ...document, ...patch } };
     persist(next);
     const updated = next[id];
+    if (requestId !== adminDocumentRequestRef.current) return updated;
     // 当前进度面板绑定 selected/uploaded；操作过程中同步替换，
     // 不需要用户再次点击“查看”才能看到最新状态。
     setSelected((currentDocument) => currentDocument?.document_id === id ? updated : currentDocument);
@@ -717,17 +710,8 @@ export default function App() {
           setMysqlCounts({ __error: error?.message || 'MySQL 统计读取失败' });
         }
       }
-      const taskByDocument = new Map();
-      for (const task of allTasks) {
-        // Supervisor 接口按 updated_at 倒序返回。同一文档可能存在历史任务，
-        // 只保留列表中最先出现的最新任务，不能被旧 FAILED 任务覆盖。
-        if (task.document_id && !taskByDocument.has(task.document_id)) {
-          taskByDocument.set(task.document_id, task);
-        }
-      }
       const nextFiles = (response.documents || []).map((item) => {
-        const task = taskByDocument.get(item.document_id) || null;
-        const resolvedTask = task || records[item.document_id]?.supervisor_task || null;
+        const resolvedTask = currentDocumentTask(item, [...allTasks, records[item.document_id]?.supervisor_task]);
         return {
           ...(records[item.document_id] || {}),
           ...item,
@@ -749,13 +733,13 @@ export default function App() {
       const currentIds = new Set(nextFiles.map((item) => item.document_id));
       setSelected((current) => current && currentIds.has(current.document_id)
         ? { ...current, ...nextFiles.find((item) => item.document_id === current.document_id) }
-        : null);
+        : current);
       setUploaded((current) => current && currentIds.has(current.document_id)
         ? { ...current, ...nextFiles.find((item) => item.document_id === current.document_id) }
-        : null);
+        : current);
       setVersionsDocument((current) => current && currentIds.has(current.document_id)
         ? { ...current, ...nextFiles.find((item) => item.document_id === current.document_id) }
-        : null);
+        : current);
     } catch (error) {
       setFiles([]);
       if (page === 'overview') setKnowledgeUpdates([]);
@@ -1193,17 +1177,25 @@ export default function App() {
   }
 
   function chooseFile(event) {
+    adminDocumentRequestRef.current += 1;
+    setParseReadState({ loading: false, error: '' });
     const selectedFile = event.target.files?.[0] || null;
     setFile(selectedFile);
     setUploaded(null); setParsed(null); setParsedDirty(false);
+    setGeneratedChunks([]);
+    setIndexPreview(null);
     if (!uploadTarget) setSelected(null);
     if (selectedFile && uploadTarget) setNotice(`已选择替换文件“${selectedFile.name}”。点击“上传替换版本”后将重新解析并建立索引。`);
   }
 
   function clearDocumentSelection() {
+    adminDocumentRequestRef.current += 1;
+    setParseReadState({ loading: false, error: '' });
+    setVersionsLoading(false);
     setSelected(null);
     setUploaded(null);
     setParsed(null);
+    setGeneratedChunks([]);
     setParsedDirty(false);
     setIndexPreview(null);
     setUploadTarget(null);
@@ -1235,7 +1227,7 @@ export default function App() {
       const response = await api.adminUpload(file, scopeId, identity.user_id, uploadKnowledgeType, createUuid(), replacingDocument?.document_id || '');
       if (!response.task_id || !response.storage_key) throw new Error(response.error || '上传成功但未返回 Supervisor 任务或 MinIO 对象地址');
       const document = updateRecord(
-        { ...response, supervisor_task_id: response.task_id, scope_id: scopeId, user_id: identity.user_id, knowledge_type: uploadKnowledgeType },
+        { ...response, active_version_id: response.version_id, active_version: null, supervisor_task: response, supervisor_task_id: response.task_id, scope_id: scopeId, user_id: identity.user_id, knowledge_type: uploadKnowledgeType },
         { stage: 'upload', status: '已上传，等待解析' },
       );
       setUploaded(document); setSelected(document); setUploadTarget(null);
@@ -1248,63 +1240,51 @@ export default function App() {
   }
 
   async function selectStoredFile(document) {
+    const requestId = ++adminDocumentRequestRef.current;
     if (document.knowledge_type) setKnowledgeType(document.knowledge_type);
-    const task = document.supervisor_task || supervisorTasks.find((item) => item.document_id === document.document_id);
-    const selectedDocument = document.storage_key
-      ? { ...document, ...(task || {}), ...(task ? taskStage(task) : {}), supervisor_task: task || document.supervisor_task, supervisor_task_id: task?.task_id || document.supervisor_task_id }
-      : { ...document, stage: 'legacy', status: '需重新上传原文件' };
-    setSelected(selectedDocument); setUploaded(null); void loadVersions(selectedDocument);
-    const localParsed = document.parsed_blocks?.length ? {
-      status: 'SUCCESS',
-      document_id: document.document_id,
-      source_name: document.file_name,
-      blocks: document.parsed_blocks,
-      raw_text: document.parsed_raw_text || '',
-      metadata: document.parsed_metadata || {},
-      edited: Boolean(document.parsed_edited),
-    } : null;
-    setParsed(localParsed);
+    const task = currentDocumentTask(document, [document.supervisor_task, ...supervisorTasks]);
+    const selectedDocument = { ...document, stage: catalogStage(document, task), supervisor_task: task, supervisor_task_id: task?.task_id || null };
+    setSelected(selectedDocument); setUploaded(null);
+    setIndexPreview(null);
+    setParsed(null);
+    setGeneratedChunks([]);
     setParsedDirty(false);
     setFile(null);
-    if (localParsed || task?.parsed_result) {
-      if (!localParsed) setParsed(task.parsed_result);
-      if (task?.status === 'FAILED') {
-        setNotice(`已选择 ${document.file_name}。上次任务失败：${task.error_code || 'UNKNOWN'} ${displayError(task.error, '未提供错误详情')}。可修正后重试。`);
-      } else {
-        setNotice(`已选择 ${document.file_name}。解析结果已恢复，可编辑后重新建立索引。`);
+    setParseReadState({ loading: true, error: '' });
+    setNotice(`正在读取 ${document.file_name} 的解析结果…`);
+    try {
+      const [details, parsedResponse] = await Promise.all([
+        loadVersions(selectedDocument, requestId),
+        api.adminParseResult(document.document_id),
+      ]);
+      if (requestId !== adminDocumentRequestRef.current) return;
+      const currentDocument = { ...selectedDocument, ...details?.document, ...details?.document?.active_version };
+      const version = currentDocumentVersion(currentDocument);
+      if (version?.status === 'PARSING') throw new Error('当前文档正在重新解析，请等待完成后再查看。');
+      if (parsedResponse?.document_id && parsedResponse.document_id !== document.document_id) throw new Error('解析结果与所选文档不一致，请刷新目录后重试。');
+      if ((parsedResponse?.version_id && version?.version_id && parsedResponse.version_id !== version.version_id)
+        || (parsedResponse?.storage_key && version?.storage_key && parsedResponse.storage_key !== version.storage_key)) {
+        throw new Error('当前版本的解析结果尚未就绪，已阻止显示旧版本内容。');
       }
-      return;
+      if (!parsedResponse || (!parsedResponse.raw_text && !parsedResponse.blocks?.length)) throw new Error('当前文档没有保存的解析结果，请先解析文档。');
+      const currentTask = currentDocumentTask(currentDocument, details?.task_records || [task]);
+      const restored = updateRecord(currentDocument, {
+        stage: catalogStage(currentDocument, currentTask),
+        supervisor_task: currentTask,
+        supervisor_task_id: currentTask?.task_id || null,
+        block_count: parsedResponse.blocks?.length || 0,
+      });
+      setParsed(parsedResponse);
+      setSelected(restored);
+      setParseReadState({ loading: false, error: '' });
+      setNotice(`已读取 ${document.file_name} 的解析原文，共 ${parsedResponse.blocks?.length || 0} 个文档块。`);
+      return { document: restored, parsed: parsedResponse };
+    } catch (error) {
+      if (requestId !== adminDocumentRequestRef.current) return;
+      const message = error.status === 404 ? '当前文档没有保存的解析结果，请先解析文档。' : error.message;
+      setParseReadState({ loading: false, error: message });
+      setNotice(`读取解析结果失败：${message}`);
     }
-    if (['WAITING_CONFIRM', 'WAITING_DRAFT_CONFIRM', 'INDEXING', 'SUCCEEDED'].includes(task?.status)) {
-      try {
-        const parsedResponse = await api.adminParseResult(document.document_id);
-        const restored = updateRecord(selectedDocument, {
-          ...task,
-          supervisor_task_id: task.task_id,
-          ...taskStage(task),
-          block_count: parsedResponse.blocks?.length || 0,
-          parsed_blocks: parsedResponse.blocks || [],
-          parsed_raw_text: parsedResponse.raw_text || '',
-          parsed_metadata: parsedResponse.metadata || {},
-          parsed_edited: Boolean(parsedResponse.edited),
-        });
-        setParsed(parsedResponse);
-        setParsedDirty(false);
-        setSelected(restored);
-        setNotice(task.status === 'SUCCEEDED'
-          ? `已选择 ${document.file_name}。索引已完成，解析结果已恢复，共 ${parsedResponse.blocks?.length || 0} 个文档块。`
-          : `已选择 ${document.file_name}。解析已完成，共 ${parsedResponse.blocks?.length || 0} 个文档块，请确认后建立索引。`);
-        return;
-      } catch (error) {
-        setNotice(`解析已完成，但读取解析结果失败：${error.message}`);
-        return;
-      }
-    }
-    if (!document.storage_key) {
-      setNotice('该记录缺少 MinIO 对象地址，是旧记录，请重新上传该文件。');
-      return;
-    }
-    setNotice(task ? `已选择 ${document.file_name}。可以继续 Supervisor 任务：开始解析。` : `该文件没有关联的 Supervisor 任务，请重新上传后再处理。`);
   }
 
   async function toggleDocumentDetails(document) {
@@ -1323,19 +1303,12 @@ export default function App() {
   }
 
   async function openIndexPreview(document) {
+    const selection = selectStoredFile(document);
+    const requestId = adminDocumentRequestRef.current;
     setIndexPreview({ document, parsed: null, loading: true, error: '' });
-    try {
-      // 先恢复当前文档的选择状态和版本信息，再读取服务端保存的完整解析结果。
-      await selectStoredFile(document);
-      const parsedResponse = await api.adminParseResult(document.document_id);
-      if (!parsedResponse?.blocks) throw new Error('当前文档没有可用的解析块');
-      setParsed(parsedResponse);
-      setParsedDirty(false);
-      setIndexPreview({ document, parsed: parsedResponse, loading: false, error: '' });
-    } catch (error) {
-      setIndexPreview({ document, parsed: null, loading: false, error: error.message });
-      setNotice(`读取 Perception 解析预览失败：${error.message}`);
-    }
+    const result = await selection;
+    if (requestId !== adminDocumentRequestRef.current) return;
+    setIndexPreview(result ? { ...result, loading: false, error: '' } : null);
   }
 
   async function uploadAndParseFromChat(selectedFile, chatSessionId = '', message = '', intentHint = '', attachmentMode = 'new', knowledgeType = '', options = {}) {
@@ -1367,48 +1340,44 @@ export default function App() {
     } finally { setBusy(''); }
   }
 
-  async function resolveSupervisorDocument(document) {
+  async function resolveSupervisorDocument(document, requestId = adminDocumentRequestRef.current) {
     if (!document?.document_id) return document;
     const currentTaskId = document.supervisor_task?.task_id || document.supervisor_task_id;
+    let task = null;
     if (currentTaskId) {
       try {
         const currentTask = await api.adminTask(currentTaskId);
-        const resolved = { ...document, ...currentTask, supervisor_task: currentTask, supervisor_task_id: currentTask.task_id };
-        if (document.draft_previews?.length) {
-          resolved.draft_previews = document.draft_previews;
-          resolved.draft_preview = document.draft_preview || document.draft_previews[0];
-        }
-        setSelected((item) => item?.document_id === document.document_id ? resolved : item);
-        setUploaded((item) => item?.document_id === document.document_id ? resolved : item);
-        return resolved;
-      } catch {
-        // 任务可能在清库、重启或保留期清理后失效，按文档重新找最新任务。
+        task = currentDocumentTask(document, [currentTask]);
+      } catch (error) {
+        if (error.status !== 404) throw new Error(`无法读取当前 Supervisor 任务：${error.message}`);
       }
     }
-    try {
-      const taskCatalog = await api.adminTasks({ document_id: document.document_id, page: 1, page_size: 100 });
-      const task = (Array.isArray(taskCatalog.items) ? taskCatalog.items : [])
-        .find((item) => item.document_id === document.document_id);
-      if (!task) return document;
-      const resolved = { ...document, ...task, supervisor_task: task, supervisor_task_id: task.task_id };
-      if (document.draft_previews?.length) {
-        resolved.draft_previews = document.draft_previews;
-        resolved.draft_preview = document.draft_preview || document.draft_previews[0];
+    if (!task) {
+      try {
+        const taskCatalog = await api.adminTasks({ document_id: document.document_id, page: 1, page_size: 100 });
+        task = currentDocumentTask(document, Array.isArray(taskCatalog.items) ? taskCatalog.items : []);
+      } catch (error) {
+        throw new Error(`无法读取当前 Supervisor 任务：${error.message}`);
       }
+    }
+    if (!task) throw new Error('当前版本缺少可用的文件处理任务，请通过“更新”重新上传；仍可查看已保存原文。');
+    const resolved = { ...document, supervisor_task: task, supervisor_task_id: task.task_id };
+    if (requestId === adminDocumentRequestRef.current) {
       setSelected((item) => item?.document_id === document.document_id ? resolved : item);
       setUploaded((item) => item?.document_id === document.document_id ? resolved : item);
-      return resolved;
-    } catch (error) {
-      throw new Error(`无法读取当前 Supervisor 任务：${error.message}`);
     }
+    return resolved;
   }
 
   async function parse(documentOverride = null) {
+    const requestId = ++adminDocumentRequestRef.current;
+    setParseReadState({ loading: false, error: '' });
     let documentToParse = documentOverride || uploaded || selected;
     if (documentToParse?.document_id) {
-      try { documentToParse = await resolveSupervisorDocument(documentToParse); }
-      catch (error) { return setNotice(error.message); }
+      try { documentToParse = await resolveSupervisorDocument(documentToParse, requestId); }
+      catch (error) { if (requestId === adminDocumentRequestRef.current) setNotice(error.message); return; }
     }
+    if (requestId !== adminDocumentRequestRef.current) return;
     if (!documentToParse?.document_id || !documentToParse?.storage_key || !documentToParse?.supervisor_task_id) return setNotice('当前文件没有可用的 Supervisor 任务，请重新上传该文件后再解析。');
     setParsed(null);
     setParsedDirty(false);
@@ -1423,12 +1392,14 @@ export default function App() {
     });
     const startedAt = performance.now();
     try {
-      const response = await parseSupervisorTask(documentToParse);
+      const response = await parseSupervisorTask(documentToParse, requestId);
+      if (requestId !== adminDocumentRequestRef.current) return;
       const parseDurationMs = Math.round(performance.now() - startedAt);
       const completedDocument = updateRecord(documentToParse, { parse_duration_ms: parseDurationMs });
       setUploaded(completedDocument); setSelected(completedDocument);
       setNotice(`解析原文已完成（${response.blocks?.length || 0} 个内容块），可继续点击“字段提取”。`);
     } catch (error) {
+      if (requestId !== adminDocumentRequestRef.current) return;
       const parseDurationMs = Math.round(performance.now() - startedAt);
       const failedDocument = updateRecord(documentToParse, { parse_duration_ms: parseDurationMs });
       setUploaded(failedDocument); setSelected(failedDocument);
@@ -1439,12 +1410,14 @@ export default function App() {
   }
 
   async function extractFields() {
+    const requestId = adminDocumentRequestRef.current;
     if (parsedDirty) return setNotice('请先点击“保存原文”或“保存分块”，再提取字段。');
     let documentToExtract = uploaded || selected;
     if (documentToExtract?.document_id) {
-      try { documentToExtract = await resolveSupervisorDocument(documentToExtract); }
-      catch (error) { return setNotice(error.message); }
+      try { documentToExtract = await resolveSupervisorDocument(documentToExtract, requestId); }
+      catch (error) { if (requestId === adminDocumentRequestRef.current) setNotice(error.message); return; }
     }
+    if (requestId !== adminDocumentRequestRef.current) return;
     const taskId = documentToExtract?.supervisor_task?.task_id || documentToExtract?.supervisor_task_id;
     if (!documentToExtract?.document_id || !taskId || !parsed) return setNotice('请先点击“开始解析”完成原文解析。');
     const extractionKnowledgeType = documentToExtract.knowledge_type || documentToExtract.supervisor_task?.knowledge_type;
@@ -1463,25 +1436,29 @@ export default function App() {
     const startedAt = performance.now();
     try {
       await api.adminExtractFields(taskId, extractionKnowledgeType);
-      const task = await waitForSupervisorTask(taskId, ['WAITING_DRAFT_CONFIRM', 'WAITING_CONFIRM', 'FAILED'], documentToExtract);
+      const task = await waitForSupervisorTask(taskId, ['WAITING_DRAFT_CONFIRM', 'WAITING_CONFIRM', 'FAILED'], documentToExtract, requestId);
       if (task.status === 'FAILED') throw new Error(displayError(task.error, '字段提取失败'));
-      const ready = await pollAdminDraft(taskId, documentToExtract);
+      const ready = await pollAdminDraft(taskId, documentToExtract, requestId);
+      if (requestId !== adminDocumentRequestRef.current) return;
       if (ready?.draft_status === 'FAILED') throw new Error(draftFailureMessage(ready));
       const updated = updateRecord(documentToExtract, { ...ready, supervisor_task_id: taskId, draft_duration_ms: Math.round(performance.now() - startedAt) });
       setUploaded(updated); setSelected(updated);
       if (ready?.draft_status === 'EMPTY') return setNotice('未指定知识类型，字段保持为空。');
       setNotice('LLM 字段草稿已生成，请检查后确认写入。');
     } catch (error) {
+      if (requestId !== adminDocumentRequestRef.current) return;
       setNotice(`字段提取失败：${displayError(error)}`);
     } finally { setBusy(''); }
   }
 
   async function confirmIndex(documentOverride = null, forceReindex = false, confirmMode = 'all') {
+    const requestId = adminDocumentRequestRef.current;
     let documentToIndex = documentOverride || uploaded || selected;
     if (documentToIndex?.document_id) {
-      try { documentToIndex = await resolveSupervisorDocument(documentToIndex); }
-      catch (error) { return setNotice(error.message); }
+      try { documentToIndex = await resolveSupervisorDocument(documentToIndex, requestId); }
+      catch (error) { if (requestId === adminDocumentRequestRef.current) setNotice(error.message); return; }
     }
+    if (requestId !== adminDocumentRequestRef.current) return;
     // supervisor_task 是服务端按更新时间选出的当前任务，优先于旧缓存里的 task_id。
     const taskId = documentToIndex?.supervisor_task?.task_id || documentToIndex?.supervisor_task_id;
     if (!parsed || !documentToIndex || !taskId) return setNotice('请先通过 Supervisor 完成当前文件的解析。');
@@ -1528,7 +1505,8 @@ export default function App() {
         const code = accepted.error_code ? `[${accepted.error_code}] ` : '';
         throw new Error(`${code}${displayError(accepted.error, '索引任务提交失败')}`);
       }
-      const response = await waitForSupervisorTask(taskId, ['SUCCEEDED', 'FAILED']);
+      const response = await waitForSupervisorTask(taskId, ['SUCCEEDED', 'FAILED'], documentToIndex, requestId);
+      if (requestId !== adminDocumentRequestRef.current) return;
       if (response.status !== 'SUCCEEDED') {
         const code = response.error_code ? `[${response.error_code}] ` : '';
         throw new Error(`${code}${displayError(response.error, '索引失败')}`);
@@ -1564,6 +1542,7 @@ export default function App() {
       setParsedDirty(false);
       if (indexPreview?.document?.document_id === document.document_id) setIndexPreview(null);
     } catch (error) {
+      if (requestId !== adminDocumentRequestRef.current) return;
       const document = updateRecord(documentToIndex, {
         stage: 'failed', status: '索引失败', error: error.message,
         error_code: error.code || undefined,
@@ -1573,6 +1552,8 @@ export default function App() {
   }
 
   function updateDocument(document) {
+    adminDocumentRequestRef.current += 1;
+    setParseReadState({ loading: false, error: '' });
     setUploadTarget(document);
     navigate('/admin', 'upload');
     setScopeId(document.scope_id || scopeId);
@@ -1806,23 +1787,35 @@ export default function App() {
     finally { setBusy(''); }
   }
 
-  async function loadVersions(document) {
-    if (!document?.document_id) return;
+  async function loadVersions(document, requestId = adminDocumentRequestRef.current) {
+    if (!document?.document_id || requestId !== adminDocumentRequestRef.current) return;
     setVersionsDocument(document); setVersions([]); setVersionsLoading(true);
     setDocumentDetails((current) => ({ ...current, [document.document_id]: null }));
     try {
       const response = await api.adminDocument(document.document_id);
+      if (requestId !== adminDocumentRequestRef.current) return;
+      const currentDocument = { ...document, ...response.document, ...response.document?.active_version };
+      const latestTask = currentDocumentTask(currentDocument, response.task_records || []);
+      const restored = updateRecord(currentDocument, {
+        stage: catalogStage(currentDocument, latestTask),
+        supervisor_task: latestTask,
+        supervisor_task_id: latestTask?.task_id || null,
+      }, requestId);
+      setVersionsDocument(restored);
       setVersions(Array.isArray(response.versions) ? response.versions : []);
       setDocumentDetails((current) => ({ ...current, [document.document_id]: {
         associated_drafts: Array.isArray(response.associated_drafts) ? response.associated_drafts : [],
         task_records: Array.isArray(response.task_records) ? response.task_records : [],
       } }));
-      const latestTask = response.task_records?.[0];
       if (latestTask) receiveAdminTaskUpdate(latestTask);
-      setNotice(`已读取 ${document.file_name} 的 ${response.versions?.length || 0} 个版本。`);
+      return response;
     } catch (error) {
+      if (requestId !== adminDocumentRequestRef.current) return;
       setNotice(`读取版本失败：${error.message}`);
-    } finally { setVersionsLoading(false); }
+      throw error;
+    } finally {
+      if (requestId === adminDocumentRequestRef.current) setVersionsLoading(false);
+    }
   }
 
   async function changeVersionPublication(version, action = 'unpublish') {
@@ -1830,6 +1823,8 @@ export default function App() {
     const republish = action === 'publish';
     const actionLabel = republish ? '重新上架' : '下架';
     if (!window.confirm(`确认${actionLabel}版本 v${version.version_number ?? ''} 吗？`)) return;
+    const requestId = adminDocumentRequestRef.current;
+    const document = versionsDocument;
     setVersionsBusy(true); setNotice(`正在${actionLabel}版本…`);
     try {
       const payload = { user_id: identity.user_id, note: '管理员工作台下架版本' };
@@ -1838,11 +1833,14 @@ export default function App() {
       } else {
         await api.adminUnpublishVersion(version.version_id, payload);
       }
-      await loadVersions(versionsDocument);
+      if (requestId !== adminDocumentRequestRef.current) return;
+      await loadVersions(document, requestId);
       await refreshFiles();
+      if (requestId !== adminDocumentRequestRef.current) return;
       const indexHint = republish && version.index_status !== 'INDEXED' ? ' 当前版本尚未建立索引，检索前请重新建立索引。' : '';
       setNotice(`版本 v${version.version_number ?? ''} 已${actionLabel}。${indexHint}`);
     } catch (error) {
+      if (requestId !== adminDocumentRequestRef.current) return;
       setNotice(`${actionLabel}版本失败：${error.message}`);
     } finally { setVersionsBusy(false); }
   }
@@ -1858,13 +1856,18 @@ export default function App() {
     if (!label || !request) return;
     const warning = action === 'purge' ? '此操作会删除该版本关联的存储与索引，无法恢复。' : '';
     if (!window.confirm(`确认${label} v${version.version_number ?? ''} 吗？${warning}`)) return;
+    const requestId = adminDocumentRequestRef.current;
+    const document = versionsDocument;
     setVersionsBusy(true); setNotice(`正在${label}…`);
     try {
       await request(version.version_id, { user_id: identity.user_id, note: `管理员工作台${label}` });
-      await loadVersions(versionsDocument);
+      if (requestId !== adminDocumentRequestRef.current) return;
+      await loadVersions(document, requestId);
       await refreshFiles();
+      if (requestId !== adminDocumentRequestRef.current) return;
       setNotice(`版本 v${version.version_number ?? ''} 已${label}。`);
     } catch (error) {
+      if (requestId !== adminDocumentRequestRef.current) return;
       setNotice(`${label}失败：${error.message}`);
     } finally { setVersionsBusy(false); }
   }
@@ -1911,29 +1914,30 @@ export default function App() {
     });
     if (!task.document_id) return;
     const patch = { supervisor_task: task, updated_at: task.updated_at };
-    setFiles((previous) => previous.map((item) => item.document_id === task.document_id
+    setFiles((previous) => previous.map((item) => currentDocumentTask(item, [task])
       ? { ...item, ...patch, ...taskStage(task, item) }
       : item));
-    setSelected((previous) => previous?.document_id === task.document_id
+    setSelected((previous) => previous && currentDocumentTask(previous, [task])
       ? { ...previous, ...patch, ...taskStage(task, previous) }
       : previous);
-    setUploaded((previous) => previous?.document_id === task.document_id
+    setUploaded((previous) => previous && currentDocumentTask(previous, [task])
       ? { ...previous, ...patch, ...taskStage(task, previous) }
       : previous);
   }, []);
 
-  async function waitForSupervisorTask(taskId, terminalStatuses, initialDocument = null) {
+  async function waitForSupervisorTask(taskId, terminalStatuses, initialDocument = null, requestId = adminDocumentRequestRef.current) {
     // 后端文件任务默认超时 900 秒；前端不能在 180 秒时提前判定失败。
     for (let attempt = 0; attempt < 900; attempt += 1) {
       const task = route === '/admin'
         ? await api.adminTask(taskId)
         : await api.adminTask(taskId);
+      if (initialDocument && !currentDocumentTask(initialDocument, [task])) throw new Error('处理任务与当前文档版本、原件或类型不一致，请刷新后重试。');
       const document = uploaded?.document_id === task.document_id
         ? uploaded
         : selected?.document_id === task.document_id
           ? selected
           : initialDocument?.document_id === task.document_id ? initialDocument : null;
-      if (document) updateRecord(document, { ...task, supervisor_task_id: task.task_id, ...taskStage(task, document) });
+      if (document && currentDocumentTask(document, [task])) updateRecord(document, { ...task, supervisor_task_id: task.task_id, ...taskStage(task, document) }, requestId);
       if (terminalStatuses.includes(task.status)) {
         await refreshFiles();
         return task;
@@ -1943,13 +1947,14 @@ export default function App() {
     throw new Error('Supervisor 任务等待超时，请在任务列表中查看状态。');
   }
 
-  async function parseSupervisorTask(document) {
+  async function parseSupervisorTask(document, requestId = adminDocumentRequestRef.current) {
     const taskId = document.supervisor_task_id || document.supervisor_task?.task_id;
     if (!taskId) throw new Error('当前文件没有 Supervisor 任务');
     if (route === '/admin') await api.adminParseTask(taskId);
     else await api.adminParseTask(taskId);
-    const task = await waitForSupervisorTask(taskId, ['WAITING_CONFIRM', 'WAITING_DRAFT_CONFIRM', 'WAITING_INTENT_CONFIRM', 'FAILED'], document);
+    const task = await waitForSupervisorTask(taskId, ['WAITING_CONFIRM', 'WAITING_DRAFT_CONFIRM', 'WAITING_INTENT_CONFIRM', 'FAILED'], document, requestId);
     if (!['WAITING_CONFIRM', 'WAITING_DRAFT_CONFIRM', 'WAITING_INTENT_CONFIRM'].includes(task.status)) throw new Error(displayError(task.error, '解析失败'));
+    if (requestId !== adminDocumentRequestRef.current) return;
 
     // Supervisor 任务状态只保存轻量字段，完整解析结果保存在 MinIO。
     // 因此不能要求任务响应直接携带 parsed_result；确认阶段从受控接口补取正文。
@@ -1964,6 +1969,7 @@ export default function App() {
       }
     }
     if (!parsedResponse?.blocks) throw new Error('解析已完成，但没有可用的解析内容');
+    if (requestId !== adminDocumentRequestRef.current) return;
     setParsed(parsedResponse); setParsedDirty(false);
     const parsedDocument = updateRecord(document, {
       ...task, supervisor_task_id: taskId,
@@ -1984,21 +1990,24 @@ export default function App() {
     };
   }
 
-  async function pollAdminDraft(taskId, document) {
+  async function pollAdminDraft(taskId, document, requestId = adminDocumentRequestRef.current) {
     let lastError = null;
     for (let attempt = 0; attempt < 300; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 1000));
+      let task;
       try {
-        const task = await api.adminTask(taskId);
-        if (task?.draft_status === 'READY' || task?.draft_status === 'FAILED' || task?.draft_status === 'EMPTY') {
-          updateRecord(document, { ...task, supervisor_task_id: taskId });
-          return task;
-        }
-        lastError = null;
+        task = await api.adminTask(taskId);
       } catch (error) {
         // 管理后台任务仍在运行时，单次网络抖动不能丢弃已生成的服务端草稿。
         lastError = error;
+        continue;
       }
+      if (!currentDocumentTask(document, [task])) throw new Error('字段任务与当前文档版本不一致');
+      if (task?.draft_status === 'READY' || task?.draft_status === 'FAILED' || task?.draft_status === 'EMPTY') {
+        updateRecord(document, { ...task, supervisor_task_id: taskId }, requestId);
+        return task;
+      }
+      lastError = null;
     }
     throw lastError || new Error('字段提取任务等待超时，请稍后重试。');
   }
@@ -2070,7 +2079,7 @@ export default function App() {
     {isAdminPage && page === 'retrieval' && <RetrievalPage query={query} setQuery={setQuery} search={search} busy={busy} searchResult={searchResult} searchScopeId={searchScopeId} setSearchScopeId={setSearchScopeId} searchScopeOptions={searchScopeOptions} searchKnowledgeType={searchKnowledgeType} setSearchKnowledgeType={setSearchKnowledgeType} identity={identity} />}
 
     {isAdminPage && page === 'upload' && <AdminUploadPage
-      intakeProps={{ fileInputRef, file, chooseFile, scopeId, setScopeId, scopeOptions, knowledgeType, setKnowledgeType, knowledgeTypes, uploadTarget, upload, busy, selected, uploaded, parse, extractFields, notice, current, currentStage, fieldPolicies: adminFieldPolicies || [], parsed, previewBlocks, generatedChunks, saveParsedRawText, saveGeneratedChunks, parsedDirty, generateChunks, updateParsedRawText, updateParsedDraft, parsedDraftRef, updateGeneratedChunk, setGeneratedChunks, setNotice, blockLocationLabel, confirmIndex, draftPreviews: current?.draft_previews || (current?.draft_preview ? [current.draft_preview] : (current?.supervisor_task?.draft_previews || (current?.supervisor_task?.draft_preview ? [current.supervisor_task.draft_preview] : []))), updateDraft: updateAdminDraft }}
+      intakeProps={{ parseReadState, fileInputRef, file, chooseFile, scopeId, setScopeId, scopeOptions, knowledgeType, setKnowledgeType, knowledgeTypes, uploadTarget, upload, busy, selected, uploaded, parse, extractFields, notice, current, currentStage, fieldPolicies: adminFieldPolicies || [], parsed, previewBlocks, generatedChunks, saveParsedRawText, saveGeneratedChunks, parsedDirty, generateChunks, updateParsedRawText, updateParsedDraft, parsedDraftRef, updateGeneratedChunk, setGeneratedChunks, setNotice, blockLocationLabel, confirmIndex, draftPreviews: current?.draft_previews || (current?.draft_preview ? [current.draft_preview] : (current?.supervisor_task?.draft_previews || (current?.supervisor_task?.draft_preview ? [current.supervisor_task.draft_preview] : []))), updateDraft: updateAdminDraft }}
       catalogProps={{ knowledgeTypes, catalogKnowledgeType, getKnowledgeType: displayKnowledgeType, switchCatalog, fieldPolicies: adminFieldPolicies || [], files, documentSearch, onDocumentSearchChange: searchAdminDocuments, documentPage, documentTotal, documentTotalPages, onDocumentPageChange: setDocumentPage, versionsDocument, toggleDocumentDetails, fileLoading, versionsProps: { versions, loading: versionsLoading, busy: versionsBusy, identity, loadVersions, associatedDrafts: documentDetails[versionsDocument?.document_id]?.associated_drafts || [], taskRecords: documentDetails[versionsDocument?.document_id]?.task_records || [], openPreview: openIndexPreview, updateDocument, changeVersionPublication, changeVersionStorage }, supervisorTasks, recoverTask, busy, refreshFiles, onSyncMysql: syncMysqlTables, onStopMysql: stopMysqlSync, mysqlSync, mysqlCounts, knowledgeUpdates: draftCatalog, onOpenKnowledgeUpdate: openKnowledgeUpdate, knowledgeUpdateDetail, knowledgeUpdateDetailLoading, onCloseKnowledgeUpdate: () => setKnowledgeUpdateDetail(null), showDraftCatalog: false, showUpdateDetail: false, showDocumentCatalog: true }}
     />}
 
@@ -2132,7 +2141,7 @@ export default function App() {
       parsed={indexPreview.parsed}
       loading={indexPreview.loading}
       busy={busy === 'index'}
-      onClose={() => setIndexPreview(null)}
+      onClose={clearDocumentSelection}
       onConfirm={() => void confirmIndex(indexPreview.document, true)}
     /></Suspense>}
 
